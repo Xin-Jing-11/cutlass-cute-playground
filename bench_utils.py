@@ -15,6 +15,7 @@ def _variant_class_name(prefix, variant):
 
 def _discover_cpp_variants(instantiate_path, symbol_prefix):
     variants = {}
+    seen = set()
     pattern = re.compile(r"^\s*INSTANTIATE_SGEMM_([A-Z0-9_]+)\((\d+)\)\s*$")
     try:
         with open(instantiate_path, "r", encoding="utf-8") as f:
@@ -24,7 +25,9 @@ def _discover_cpp_variants(instantiate_path, symbol_prefix):
                     continue
                 variant = match.group(1).lower()
                 block = match.group(2)
-                variants[variant] = f"{symbol_prefix}{variant}_{block}"
+                key = f"{variant}_{block}" if variant in seen else variant
+                seen.add(variant)
+                variants[key] = f"{symbol_prefix}{variant}_{block}"
     except OSError:
         pass
     return variants
