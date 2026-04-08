@@ -66,18 +66,20 @@ def resolve_problem_shape(args):
 
 
 def reference_problem(M, N, K):
+    """TN layout: D = alpha * A^T * B + beta * C.
+    A stored (K,M) col-major, B stored (K,N) col-major, C stored (M,N) col-major.
+    """
     np.random.seed(42)
-    A = np.asfortranarray(np.random.randn(M, K).astype(np.float32))
-    B_kn = np.random.randn(K, N).astype(np.float32)
-    B = np.asfortranarray(B_kn)
-    C = np.asfortranarray(np.random.randn(M, N).astype(np.float32))
-    D_ref = A @ B_kn + C
-    return A, B_kn, B, C, D_ref.astype(np.float32)
+    A = np.asfortranarray(np.random.randn(K, M).astype(np.float32))   # (K,M) col-major
+    B = np.asfortranarray(np.random.randn(K, N).astype(np.float32))   # (K,N) col-major
+    C = np.asfortranarray(np.random.randn(M, N).astype(np.float32))   # (M,N) col-major
+    D_ref = (A.T @ B + C).astype(np.float32)
+    return A, B, C, D_ref
 
 
 def check_cuda(M, N, K, atol, rtol, variant=None):
     lib = load_cuda_lib()
-    A, _, B, C, D_ref = reference_problem(M, N, K)
+    A, B, C, D_ref = reference_problem(M, N, K)
 
     results = []
     for variant_name, symbol_name in sorted(CUDA_VARIANTS.items()):
@@ -121,7 +123,7 @@ def check_cuda(M, N, K, atol, rtol, variant=None):
 
 def check_cutlass(M, N, K, atol, rtol, variant=None):
     lib = load_cutlass_lib()
-    A, _, B, C, D_ref = reference_problem(M, N, K)
+    A, B, C, D_ref = reference_problem(M, N, K)
 
     results = []
     for variant_name, symbol_name in sorted(CUTLASS_VARIANTS.items()):
@@ -138,7 +140,7 @@ def check_cutlass(M, N, K, atol, rtol, variant=None):
             kernel(
                 M, N, K,
                 ctypes.c_float(1.0),
-                ctypes.c_void_p(dA), M,
+                ctypes.c_void_p(dA), K,
                 ctypes.c_void_p(dB), K,
                 ctypes.c_float(1.0),
                 ctypes.c_void_p(dC), M,
@@ -167,16 +169,17 @@ def check_cutedsl(M, N, K, atol, rtol, variant=None):
     import cupy as cp
     from cutlass.cute.runtime import from_dlpack
 
-    A, B_kn, _, C, D_ref = reference_problem(M, N, K)
-    B_nk = np.asfortranarray(B_kn.T)
+    A, B, C, D_ref = reference_problem(M, N, K)
 
-    A_d = cp.array(A, order="F")
-    B_d = cp.array(B_nk, order="F")
-    C_d = cp.array(C, order="F")
+    # A is (K,M) col-major, B is (K,N) col-major, C is (M,N) col-major
+    A_d = cp.array(A, order="F")      # (K,M) on GPU
+    B_d = cp.array(B, order="F")      # (K,N) on GPU
+    C_d = cp.array(C, order="F")      # (M,N) on GPU
 
-    A_t = from_dlpack(A_d, assumed_align=16)
-    B_t = from_dlpack(B_d, assumed_align=16)
-    C_t = from_dlpack(C_d, assumed_align=16)
+    # CuTeDSL kernel expects mA=(M,K), mB=(N,K), mC=(M,N) — transpose A and B
+    A_t = from_dlpack(A_d.T, assumed_align=16)   # (M,K):(K,1)
+    B_t = from_dlpack(B_d.T, assumed_align=16)   # (N,K):(K,1)
+    C_t = from_dlpack(C_d, assumed_align=16)     # (M,N):(1,M)
 
     results = []
     for variant_name, (module_name, class_name) in sorted(CUTEDSL_VARIANTS.items()):

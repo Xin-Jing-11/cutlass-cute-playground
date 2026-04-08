@@ -1,5 +1,5 @@
 // Instantiates CUDA SGEMM kernels as extern "C" for Python ctypes.
-// C = alpha * A * B + beta * C, all matrices column-major.
+// TN: D = alpha * A^T * B + beta * C. A(K,M), B(K,N), C(M,N) all col-major.
 
 #include "sgemm_naive.cuh"
 #include "sgemm_smem.cuh"
@@ -44,6 +44,6 @@ INSTANTIATE_SGEMM_SMEM(32)
   }
 
 INSTANTIATE_SGEMM_TILING(64, 64, 16, 8, 8)
-INSTANTIATE_SGEMM_TILING(128, 128, 8, 8, 8)
+INSTANTIATE_SGEMM_TILING(128, 128, 16, 8, 8)
 
 #undef INSTANTIATE_SGEMM_TILING

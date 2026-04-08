@@ -10,7 +10,7 @@
     ncu \
       --set full \
       --target-processes all \
-      -o "ncu_report/ncu_$(basename "${SCRIPT}" .py)" \
+      -o "ncu_report/ncu_$(basename "${SCRIPT}" .py)_$(date +%Y%m%d_%H%M%S)" \
       python3 "$SCRIPT" "$@"
 
-    echo "Report saved to ncu_$(basename "${SCRIPT}" .py).ncu-rep"
+    echo "Report saved to ncu_report/ncu_$(basename "${SCRIPT}" .py)_*.ncu-rep"

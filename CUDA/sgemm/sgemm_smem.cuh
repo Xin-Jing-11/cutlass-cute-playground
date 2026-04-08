@@ -3,8 +3,8 @@
 #include "../share.cuh"
 
 /*
- * SMEM SGEMM: C = alpha * A * B + beta * C
- * A(M,K), B(K,N), C(M,N), all column-major, single precision.
+ * SMEM SGEMM (TN): C = alpha * A^T * B + beta * C
+ * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  * 
  * # of gmem load: 2MNK/BLOCK_SZIE
  * # of smem load: 2MNK
@@ -26,7 +26,7 @@ __global__ void sgemm_smem_kernel(
     int bn = blockIdx.y * BLOCK_SIZE;
 
     // advance gmem pointer
-    A += bm;        // (bm, 0)
+    A += bm * K;    // (bm, 0)
     B += bn * K;    // (0, bn)
 
     // for local access
@@ -37,21 +37,28 @@ __global__ void sgemm_smem_kernel(
     __shared__ float As[BLOCK_SIZE * BLOCK_SIZE];
     __shared__ float Bs[BLOCK_SIZE * BLOCK_SIZE];
 
+    // swizzle function to reduce bank conflict
+    constexpr int SWZ_BITS = __builtin_ctz(BLOCK_SIZE);
+    auto swz = [](int idx) { return swizzle<SWZ_BITS, 0, SWZ_BITS>(idx); };
+
     float acc = 0.0f;
     for (int bk = 0; bk < K; bk += BLOCK_SIZE) {
         // load smem 
-        // As(tx, ty) = A(bm + tx, bk + ty)
-        As[tx + ty * BLOCK_SIZE] = A[tx + ty * M];
+        // As(tx, ty) = A(bm + ty, bk + tx)
+        // reduce bank conflict by swizzle 
+        As[swz(tx + ty * BLOCK_SIZE)] = A[ty * K + tx];
         // Bs(tx, ty) = B(bk + tx, bn + ty)
         Bs[tx + ty * BLOCK_SIZE] = B[tx + ty * K];
         __syncthreads();
 
         // advance gmem pointer
-        A += BLOCK_SIZE * M;    // (bm, bk)
-        B += BLOCK_SIZE;        // (bk, bn)
+        A += BLOCK_SIZE;    // (bm, bk)
+        B += BLOCK_SIZE;    // (bk, bn)
 
+        // As access has bank conflict if without swizzle. Bs broadcast.
+        #pragma unroll
         for (auto i = 0; i < BLOCK_SIZE; i++) {
-            acc += As[tx + i * BLOCK_SIZE] * Bs[i + ty * BLOCK_SIZE];
+            acc += As[swz(i + tx * BLOCK_SIZE)] * Bs[i + ty * BLOCK_SIZE];
         }
         __syncthreads();
     }

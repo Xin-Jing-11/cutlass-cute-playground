@@ -2,8 +2,8 @@
 #include <cute/tensor.hpp>
 
 /*
- * SMEM SGEMM using CuTe: C = alpha * A * B + beta * C
- * A(M,K), B(K,N), C(M,N), all column-major, single precision.
+ * SMEM SGEMM using CuTe: C = alpha * A^T * B + beta * C
+ * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  *
  * BLK_M x BLK_N threads per CTA, K=1 tile (no K-blocking).
  * shared memory tiling.
@@ -78,8 +78,8 @@ void sgemm_smem_device(
     axpby(alpha, tCrC, beta, tCgC);
 }
 
-// SGEMM: C = alpha * A * B + beta * C  (float32 in/out)
-// A(M,K), B(K,N), C(M,N), all column-major
+// SGEMM: C = alpha * A^T * B + beta * C  (float32 in/out)
+// A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
 template <int BLOCK_SIZE = 32>
 void sgemm_smem(
     int m, int n, int k,
@@ -94,17 +94,20 @@ void sgemm_smem(
     auto cta_tiler = make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{});
     auto shape_MNK = make_shape(m, n, k);
 
-    auto dA = make_stride(Int<1>{}, ldA);
+    auto dA = make_stride(ldA, Int<1>{});
     auto dB = make_stride(ldB, Int<1>{});
     auto dC = make_stride(Int<1>{}, ldC);
 
     // for coalesced access
-    auto tA = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
+    auto tA = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{});
     auto tB = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{});
     auto tC = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
 
-    // define smem layout (column major)
-    auto sA_layout = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
+    // define smem layout via swizzle atom + tile_to_shape (same pattern as sgemm_tiling)
+    constexpr int SWZ_B = __builtin_ctz(BLOCK_SIZE);
+    auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_B>{},
+        make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{}));
+    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
     auto sB_layout = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{});
     auto sC_layout = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
 

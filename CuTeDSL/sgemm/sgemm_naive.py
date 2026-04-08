@@ -1,11 +1,10 @@
 """
-Naive SGEMM using CuTe DSL: C = alpha * A * B + beta * C
+Naive SGEMM using CuTe DSL (TN): C = alpha * A^T * B + beta * C
 
 Each thread computes one element. No shared memory, no tiling.
 Global memory loads directly into registers, scalar FMA loop.
 
-A(M,K) col-major, B(N,K) col-major, C(M,N) col-major.
-Float32 in/out.
+A (M,K):(K,1), B (N,K):(K,1), C (M,N):(1,M), Float32 in/out.
 """
 
 import sys
@@ -33,9 +32,9 @@ class SgemmNaive:
     @cute.jit
     def __call__(
         self,
-        mA: cute.Tensor,  # (M, K) col-major, f32
-        mB: cute.Tensor,  # (N, K) col-major, f32
-        mC: cute.Tensor,  # (M, N) col-major, f32
+        mA: cute.Tensor,  # (M, K):(K,1) K-contiguous, f32
+        mB: cute.Tensor,  # (N, K):(K,1) K-contiguous, f32
+        mC: cute.Tensor,  # (M, N):(1,M) col-major, f32
         alpha: cutlass.Float32 = 1.0,
         beta: cutlass.Float32 = 0.0,
         stream: cuda_driver.CUstream = cuda_driver.CUstream(

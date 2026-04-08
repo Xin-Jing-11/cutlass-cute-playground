@@ -1,8 +1,9 @@
 // Instantiates CUTLASS SGEMM kernels as extern "C" for Python ctypes.
-// C = alpha * A * B + beta * C, all matrices column-major.
+// TN: D = alpha * A^T * B + beta * C. A(K,M), B(K,N), C(M,N) all col-major.
 
 #include "sgemm_naive.cuh"
 #include "sgemm_smem.cuh"
+#include "sgemm_tiling.cuh"
 
 #define INSTANTIATE_SGEMM_NAIVE(BLOCK)                                      \
   extern "C" void cutlass_sgemm_naive_##BLOCK(                              \
@@ -33,3 +34,20 @@ INSTANTIATE_SGEMM_NAIVE(32)
 INSTANTIATE_SGEMM_SMEM(32)
 
 #undef INSTANTIATE_SGEMM_SMEM
+
+#define INSTANTIATE_SGEMM_TILING(BM, BN, BK, TM, TN)                          \
+  extern "C" void cutlass_sgemm_tiling_##BM##x##BN##x##BK##x##TM##x##TN(      \
+      int m, int n, int k,                                                     \
+      float alpha,                                                             \
+      const float* A, int ldA,                                                 \
+      const float* B, int ldB,                                                 \
+      float beta,                                                              \
+      float* C, int ldC) {                                                     \
+    sgemm_tiling<BM, BN, BK, TM, TN>(m, n, k, alpha, A, ldA, B, ldB,         \
+                                      beta, C, ldC);                           \
+  }
+
+INSTANTIATE_SGEMM_TILING(64, 64, 16, 8, 8)
+INSTANTIATE_SGEMM_TILING(128, 128, 16, 8, 8)
+
+#undef INSTANTIATE_SGEMM_TILING

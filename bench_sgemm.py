@@ -37,7 +37,7 @@ _cutedsl_compiled = {}
 
 
 def bench_cublas(M, N, K, warmup=5, iters=20):
-    """Benchmark cuBLAS SGEMM with column-major inputs."""
+    """Benchmark cuBLAS SGEMM TN: D = A^T * B."""
     blas = load_cublas()
 
     blas.cublasCreate_v2.restype = ctypes.c_int
@@ -56,7 +56,8 @@ def bench_cublas(M, N, K, warmup=5, iters=20):
         ctypes.c_void_p, ctypes.c_int,
     ]
 
-    A_h = np.asfortranarray(np.random.randn(M, K).astype(np.float32))
+    # TN: A stored (K,M) col-major, B stored (K,N) col-major, C (M,N) col-major
+    A_h = np.asfortranarray(np.random.randn(K, M).astype(np.float32))
     B_h = np.asfortranarray(np.random.randn(K, N).astype(np.float32))
     C_h = np.asfortranarray(np.zeros((M, N), dtype=np.float32))
 
@@ -70,14 +71,15 @@ def bench_cublas(M, N, K, warmup=5, iters=20):
     alpha = np.array([1.0], dtype=np.float32)
     beta = np.array([0.0], dtype=np.float32)
 
+    CUBLAS_OP_T = 1
     CUBLAS_OP_N = 0
 
     def run():
         blas.cublasSgemm_v2(
-            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
             M, N, K,
             alpha.ctypes.data,
-            ctypes.c_void_p(dA), M,
+            ctypes.c_void_p(dA), K,
             ctypes.c_void_p(dB), K,
             beta.ctypes.data,
             ctypes.c_void_p(dC), M,
@@ -100,8 +102,8 @@ def bench_cuda(M, N, K, warmup=5, iters=20):
         name = f"cuda:{variant_name}"
         dA = dB = dC = None
         try:
-            # CUDA kernels in this repo are column-major.
-            A_h = np.asfortranarray(np.random.randn(M, K).astype(np.float32))
+            # TN: A stored (K,M) col-major, B stored (K,N) col-major
+            A_h = np.asfortranarray(np.random.randn(K, M).astype(np.float32))
             B_h = np.asfortranarray(np.random.randn(K, N).astype(np.float32))
             C_h = np.asfortranarray(np.zeros((M, N), dtype=np.float32))
 
@@ -145,7 +147,8 @@ def bench_cutlass(M, N, K, warmup=5, iters=20):
         name = f"cutlass:{variant_name}"
         dA = dB = dC = None
         try:
-            A_h = np.asfortranarray(np.random.randn(M, K).astype(np.float32))
+            # TN: A stored (K,M) col-major, B stored (K,N) col-major
+            A_h = np.asfortranarray(np.random.randn(K, M).astype(np.float32))
             B_h = np.asfortranarray(np.random.randn(K, N).astype(np.float32))
             C_h = np.asfortranarray(np.zeros((M, N), dtype=np.float32))
 
@@ -159,7 +162,7 @@ def bench_cutlass(M, N, K, warmup=5, iters=20):
                 kernel(
                     M, N, K,
                     ctypes.c_float(1.0),
-                    ctypes.c_void_p(dA), M,
+                    ctypes.c_void_p(dA), K,
                     ctypes.c_void_p(dB), K,
                     ctypes.c_float(0.0),
                     ctypes.c_void_p(dC), M,
@@ -185,16 +188,18 @@ def bench_cutedsl(M, N, K, warmup=5, iters=20):
     import cupy as cp
     from cutlass.cute.runtime import from_dlpack
 
-    A_h = np.asfortranarray(np.random.randn(M, K).astype(np.float32))
-    B_h = np.asfortranarray(np.random.randn(K, N).astype(np.float32).T)
+    # TN: A stored (K,M) col-major, B stored (K,N) col-major, C (M,N) col-major
+    A_h = np.asfortranarray(np.random.randn(K, M).astype(np.float32))
+    B_h = np.asfortranarray(np.random.randn(K, N).astype(np.float32))
 
-    A_d = cp.array(A_h, order="F")
-    B_d = cp.array(B_h, order="F")
+    A_d = cp.array(A_h, order="F")      # (K,M) on GPU
+    B_d = cp.array(B_h, order="F")      # (K,N) on GPU
     C_d = cp.zeros((M, N), dtype=cp.float32, order="F")
 
-    A_t = from_dlpack(A_d, assumed_align=16)
-    B_t = from_dlpack(B_d, assumed_align=16)
-    C_t = from_dlpack(C_d, assumed_align=16)
+    # CuTeDSL expects mA=(M,K), mB=(N,K), mC=(M,N) — transpose A and B
+    A_t = from_dlpack(A_d.T, assumed_align=16)   # (M,K):(K,1)
+    B_t = from_dlpack(B_d.T, assumed_align=16)   # (N,K):(K,1)
+    C_t = from_dlpack(C_d, assumed_align=16)     # (M,N):(1,M)
 
     results = []
     for variant_name, (module_name, class_name) in sorted(CUTEDSL_VARIANTS.items()):

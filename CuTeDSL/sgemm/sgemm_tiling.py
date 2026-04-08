@@ -1,8 +1,8 @@
 """
-Smem SGEMM using CuTe DSL (TN): D = alpha * A^T * B + beta * C
+Tiling SGEMM using CuTe DSL (TN): D = alpha * A^T * B + beta * C
 
-Each thread computes one element. Shared memory tiling with
-gmem → smem → register pipeline per K-tile.
+Register tiling: each thread computes TM x TN output elements.
+Shared memory tiling with gmem → smem → register pipeline per K-tile.
 XOR swizzle on sA via ComposedLayout + tiled_copy/tiled_mma.
 
 A stored (K,M) col-major → CuTe (M,K):(K,1).
@@ -20,15 +20,22 @@ import cutlass.cute as cute
 from cutlass.cute import nvgpu
 
 
-class SgemmSmem:
+class SgemmTiling:
     """
-    Smem SGEMM: BLOCK_SIZE x BLOCK_SIZE threads per CTA.
+    Tiling SGEMM: (BM/TM) x (BN/TN) threads per CTA.
+    Each thread computes TM x TN output elements.
     tiled_copy for gmem→smem (swizzle-aware partition_D).
     tiled_mma + make_tiled_copy_A/B for compute (swizzle-aware partition_S).
     """
 
-    def __init__(self, block_size=32):
-        self._block_size = block_size
+    def __init__(self, bm=128, bn=128, bk=16, tm=8, tn=8):
+        self._bm = bm
+        self._bn = bn
+        self._bk = bk
+        self._tm = tm
+        self._tn = tn
+        assert bm % tm == 0 and bn % tn == 0
+        assert bk >= bn // tn and bk >= bm // tm, "BK must be >= Tn and Tm"
 
     @cute.jit
     def __call__(
@@ -42,30 +49,34 @@ class SgemmSmem:
             cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
         ),
     ):
-        BS = self._block_size
+        BM, BN, BK = self._bm, self._bn, self._bk
+        TM, TN = self._tm, self._tn
+        Tm, Tn = BM // TM, BN // TN
 
         # --- Swizzled sA layout via composed atom + tile_to_shape ---
-        swz_B = int(math.log2(BS))
+        atom_M = max(BK, Tm)  # satisfy |S| >= B
+        swz_B = int(math.log2(BK))
+        swz_S = int(math.log2(atom_M))
         swizzle_atom = cute.make_composed_layout(
-            cute.make_swizzle(swz_B, 0, swz_B), 0,
-            cute.make_layout((BS, BS), stride=(BS, 1)))  # row-major atom
-        sA_layout = cute.tile_to_shape(swizzle_atom, (BS, BS), (0, 1))
-        sB_layout = cute.make_layout((BS, BS), stride=(BS, 1))  # row-major, no swizzle
+            cute.make_swizzle(swz_B, 0, swz_S), 0,
+            cute.make_layout((atom_M, BK), stride=(BK, 1)))  # row-major atom
+        sA_layout = cute.tile_to_shape(swizzle_atom, (BM, BK), (0, 1))
+        sB_layout = cute.make_layout((BN, BK), stride=(BK, 1))  # row-major, no swizzle
 
         # --- gmem→smem tiled_copy ---
         copy_atom = cute.make_copy_atom(
             nvgpu.CopyUniversalOp(), mA.element_type,
             num_bits_per_copy=mA.element_type.width)
-        thr_layout = cute.make_layout((BS, BS), stride=(BS, 1))  # row-major
+        thr_layout = cute.make_layout((Tm, Tn), stride=(Tn, 1))  # row-major
         val_layout = cute.make_layout((1, 1))
         tiled_copy_A = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
         tiled_copy_B = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
-        # --- tiled_mma: scalar FMA across (BS, BS) threads ---
+        # --- tiled_mma: scalar FMA across (Tm, Tn) threads ---
         mma_op = cute.make_mma_atom(nvgpu.MmaUniversalOp(cutlass.Float32))
         tiled_mma = cute.make_tiled_mma(
             mma_op,
-            cute.make_layout((BS, BS, 1), stride=(1, BS, 0)))
+            cute.make_layout((Tm, Tn, 1), stride=(1, Tm, 0)))
 
         # --- smem→register copies aligned with MMA ---
         s2r_atom = cute.make_copy_atom(
@@ -74,7 +85,7 @@ class SgemmSmem:
         s2r_copy_A = cute.make_tiled_copy_A(s2r_atom, tiled_mma)
         s2r_copy_B = cute.make_tiled_copy_B(s2r_atom, tiled_mma)
 
-        grid_dim = (*cute.ceil_div(mC.shape, (BS, BS)), 1)
+        grid_dim = (*cute.ceil_div(mC.shape, (BM, BN)), 1)
 
         self.kernel(
             mA, mB, mC, alpha, beta,
@@ -83,7 +94,7 @@ class SgemmSmem:
             sA_layout, sB_layout,
         ).launch(
             grid=grid_dim,
-            block=[BS * BS, 1, 1],
+            block=[Tm * Tn, 1, 1],
             stream=stream,
         )
 
@@ -103,8 +114,8 @@ class SgemmSmem:
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.Layout,
     ):
-        BS = self._block_size
-        cta_tiler = (BS, BS, BS)
+        BM, BN, BK = self._bm, self._bn, self._bk
+        cta_tiler = (BM, BN, BK)
 
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
@@ -131,20 +142,20 @@ class SgemmSmem:
 
         # --- MMA partitions ---
         thr_mma = tiled_mma.get_slice(tidx)
-        tCgC = thr_mma.partition_C(gC)                    # (MMA, MMA_M, MMA_N)
-        tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))  # (MMA, MMA_M, MMA_K)
-        tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))  # (MMA, MMA_N, MMA_K)
-        tCrC = tiled_mma.make_fragment_C(tCgC)            # (MMA, MMA_M, MMA_N)
+        tCgC = thr_mma.partition_C(gC)                              # (MMA, MMA_M, MMA_N)
+        tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))   # (MMA, MMA_M, MMA_K)
+        tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))   # (MMA, MMA_N, MMA_K)
+        tCrC = tiled_mma.make_fragment_C(tCgC)                      # (MMA, MMA_M, MMA_N)
         tCrC.fill(0.0)
 
-        # --- smem→register copies aligned with MMA (partition_S handles swizzle) ---
+        # --- smem→register copies (partition_S handles swizzle) ---
         thr_s2r_a = s2r_A.get_slice(tidx)
-        tXsA = thr_s2r_a.partition_S(sA)                  # (CPY, MMA_M, MMA_K)
-        tXrA = thr_s2r_a.retile(tCrA)                   # (CPY, MMA_M, MMA_K)
+        tXsA = thr_s2r_a.partition_S(sA)    # (CPY, MMA_M, MMA_K)
+        tXrA = thr_s2r_a.retile(tCrA)       # (CPY, MMA_M, MMA_K)
 
         thr_s2r_b = s2r_B.get_slice(tidx)
-        tXsB = thr_s2r_b.partition_S(sB)                  # (CPY, MMA_N, MMA_K)
-        tXrB = thr_s2r_b.retile(tCrB)                   # (CPY, MMA_N, MMA_K)
+        tXsB = thr_s2r_b.partition_S(sB)    # (CPY, MMA_N, MMA_K)
+        tXrB = thr_s2r_b.retile(tCrB)       # (CPY, MMA_N, MMA_K)
 
         # Mainloop
         k_max = cute.size(tAgA, mode=[3])

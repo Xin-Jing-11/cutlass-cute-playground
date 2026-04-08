@@ -3,8 +3,8 @@
 #include "../share.cuh"
 
 /*
- * Tiling SGEMM: C = alpha * A * B + beta * C
- * A(M,K), B(K,N), C(M,N), all column-major, single precision.
+ * TILING SGEMM (TN): C = alpha * A^T * B + beta * C
+ * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  * 
  * BM, BN, BK: tile size for M, N, K dimension
  * TM, TN: tile size for thread local register
@@ -30,30 +30,37 @@ __global__ void sgemm_tiling_kernel(
     int bn = blockIdx.y * BN;
 
     // advance gmem pointer 
-    A += bm;     // (bm, 0)
+    A += bm * K; // (bm, 0)
     B += bn * K; // (0, bn)
 
     // for local access 
-    int Tm = BM / TM; // # of thread in M dimension
+    constexpr int Tm = BM / TM; // # of thread in M dimension
     // int Tn = BN / TN; // # of thread in N dimension
 
     int tx = threadIdx.x % Tm; // [0, BM/TM)
     int ty = threadIdx.x / Tm; // [0, BN/TN)
 
-    // for loading shared memory, number of elements loaded by each thread 
-    int strideA = BK * TM * TN / BN; // stride for loading A to smem, in element
-    int offsetA = strideA * threadIdx.x; // offset for loading A to smem, in element
-    int idxAm = offsetA % BM;
-    int idxAk = offsetA / BM;
+    // for loading shared memory
+    constexpr int iterA = BK * TM * TN / BN; // number of iterations loaded by each thread 
+    int idxAm = threadIdx.x / BK;
+    int idxAk = threadIdx.x % BK;
+    int nrowsA = blockDim.x / BK;
 
-    int strideB = BK * TM * TN / BM; // stride for loading B to smem, in element
-    int offsetB = strideB * threadIdx.x; // offset for loading B to smem, in element
-    int idxBk = offsetB % BK;
-    int idxBn = offsetB / BK;
+    constexpr int iterB = BK * TM * TN / BM; // number of iterations loaded by each thread 
+    int idxBk = threadIdx.x % BK;
+    int idxBn = threadIdx.x / BK;
+    int ncolsB = blockDim.x / BK;
 
     // shared memory 
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
+
+    // swizzle functions to reduce bank conflict
+    // S must match where the thread-varying bits are in each smem's linear index
+    // As[m * BK + k]: threads vary in m with stride TM → varying bit at log2(BK*TM)
+    constexpr int SWZ_B = __builtin_ctz(BK);
+    constexpr int SWZ_S = __builtin_ctz(BK * TM);
+    auto swzA = [](int idx) { return swizzle<SWZ_B, 0, SWZ_S>(idx); };
 
     // accumulator in register 
     float accum[TM * TN] = {0.0f};
@@ -62,31 +69,40 @@ __global__ void sgemm_tiling_kernel(
     float regN[TN] = {0.0f};
 
     for (int bk = 0; bk < K; bk += BK) {
-        // load shared memory 
-        for (int i = 0; i < strideA; i++) {
-            As[offsetA + i] = A[idxAm + i + idxAk * M];
+        // load shared memory
+        #pragma unroll
+        for (int i = 0; i < iterA; i++) {
+            int m = idxAm + i * nrowsA;
+            As[swzA(m * BK + idxAk)] = A[m * K + idxAk];
         }
-        
-        for (int j = 0; j < strideB; j++) {
-            Bs[offsetB + j] = B[idxBk + j + idxBn * K];
+
+        #pragma unroll
+        for (int j = 0; j < iterB; j++) {
+            int n = idxBn + j * ncolsB;
+            Bs[idxBk + n * BK] = B[idxBk + n * K];
         }
         __syncthreads();
 
         // advance gmem pointer
-        A += BK * M; // (bm, bk)
-        B += BK;     // (bk, bn)
+        A += BK; // (bm, bk)
+        B += BK; // (bk, bn)
 
+        #pragma unroll
         for (int k = 0; k < BK; k++) {
-            // load tile into register 
+            // load tile into register
+            #pragma unroll
             for (int i = 0; i < TM; i++) {
-                regM[i] = As[tx * TM + i + k * BM];
+                regM[i] = As[swzA((tx * TM + i) * BK + k)];
             }
+            #pragma unroll
             for (int j = 0; j < TN; j++) {
                 regN[j] = Bs[k + (ty * TN + j) * BK];
             }
 
             // compute
+            #pragma unroll
             for (int j = 0; j < TN; j++) {
+                #pragma unroll
                 for (int i = 0; i < TM; i++) {
                     accum[i + j * TM] += regM[i] * regN[j];
                 }

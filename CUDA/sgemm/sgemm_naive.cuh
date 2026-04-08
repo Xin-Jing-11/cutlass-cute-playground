@@ -1,9 +1,9 @@
 #pragma once
 #include "../share.cuh"
 /*
- * Naive SGEMM: C = alpha * A * B + beta * C
- * A(M,K), B(K,N), C(M,N), all column-major, single precision.
- * 
+ * Naive SGEMM (TN): C = alpha * A^T * B + beta * C
+ * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
+ *
  * # of gmem load: 2MNK
  */
 
@@ -19,14 +19,12 @@ __global__ void sgemm_naive_kernel(
     int m = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     int n = blockIdx.y * BLOCK_SIZE + threadIdx.y;
 
-    if (m < M && n < N) {
-        float acc = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            // broadcast A and coalesce B 
-            acc += A[m + k * M] * B[k + n * K];
-        }
-        C[m + n * M] = alpha * acc + beta * C[m + n * M];
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        // A access is not coalesced 
+        acc += A[m * K + k] * B[n * K + k];
     }
+    C[m + n * M] = alpha * acc + beta * C[m + n * M];
 }
 
 template <int BLOCK_SIZE = 32>

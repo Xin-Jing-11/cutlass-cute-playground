@@ -2,8 +2,8 @@
 #include <cute/tensor.hpp>
 
 /*
- * Naive SGEMM using CuTe: C = alpha * A * B + beta * C
- * A(M,K), B(K,N), C(M,N), all column-major, single precision.
+ * Naive SGEMM using CuTe (TN): C = alpha * A^T * B + beta * C
+ * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  *
  * BLK_M x BLK_N threads per CTA, K=1 tile (no K-blocking).
  * No shared memory, no register tiling.
@@ -56,8 +56,8 @@ void sgemm_naive_device(
     axpby(alpha, tCrC, beta, tCgC);
 }
 
-// SGEMM: C = alpha * A * B + beta * C  (float32 in/out)
-// A(M,K), B(K,N), C(M,N), all column-major
+// SGEMM TN: D = alpha * A^T * B + beta * C  (float32 in/out)
+// A (M,K):(K,1), B (N,K):(K,1), C (M,N):(1,M)
 template <int BLOCK_SIZE = 32>
 void sgemm_naive(
     int m, int n, int k,
@@ -72,12 +72,15 @@ void sgemm_naive(
     auto cta_tiler = make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}, Int<1>{});
     auto shape_MNK = make_shape(m, n, k);
 
-    auto dA = make_stride(Int<1>{}, ldA);
+    // A logical (M,K): stride (ldA=K, 1), K-contiguous  (transposed storage)
+    auto dA = make_stride(ldA, Int<1>{});
+    // B logical (N,K): stride (ldB=K, 1), K-contiguous  (col-major (K,N) seen as (N,K))
     auto dB = make_stride(ldB, Int<1>{});
+    // C (M,N): col-major
     auto dC = make_stride(Int<1>{}, ldC);
 
-    // for coalesced access
-    auto tA = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
+    // tA/tB are not used at all
+    auto tA = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{});
     auto tB = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{});
     auto tC = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
 
