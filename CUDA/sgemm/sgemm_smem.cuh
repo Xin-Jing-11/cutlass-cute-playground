@@ -7,8 +7,7 @@
  * A(M,K), B(K,N), C(M,N), all column-major, single precision.
  * 
  * # of gmem load: 2MNK/BLOCK_SZIE
- * # of smem read: 2MNK/BLOCK_SZIE
- * # of smem load: 2MNK/BLOCK_SZIE
+ * # of smem load: 2MNK
  */
 
 template <int BLOCK_SIZE = 32>

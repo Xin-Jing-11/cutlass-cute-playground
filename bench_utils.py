@@ -16,18 +16,30 @@ def _variant_class_name(prefix, variant):
 def _discover_cpp_variants(instantiate_path, symbol_prefix):
     variants = {}
     seen = set()
-    pattern = re.compile(r"^\s*INSTANTIATE_SGEMM_([A-Z0-9_]+)\((\d+)\)\s*$")
+    # Match single-param: INSTANTIATE_SGEMM_NAIVE(32)
+    pat_single = re.compile(r"^\s*INSTANTIATE_SGEMM_([A-Z0-9_]+)\((\d+)\)\s*$")
+    # Match multi-param:  INSTANTIATE_SGEMM_TILING(32, 32, 8, 8, 8)
+    pat_multi = re.compile(
+        r"^\s*INSTANTIATE_SGEMM_([A-Z0-9_]+)\((\d+(?:\s*,\s*\d+)+)\)\s*$"
+    )
     try:
         with open(instantiate_path, "r", encoding="utf-8") as f:
             for line in f:
-                match = pattern.match(line)
-                if not match:
+                m = pat_single.match(line)
+                if m:
+                    variant = m.group(1).lower()
+                    block = m.group(2)
+                    key = f"{variant}_{block}" if variant in seen else variant
+                    seen.add(variant)
+                    variants[key] = f"{symbol_prefix}{variant}_{block}"
                     continue
-                variant = match.group(1).lower()
-                block = match.group(2)
-                key = f"{variant}_{block}" if variant in seen else variant
-                seen.add(variant)
-                variants[key] = f"{symbol_prefix}{variant}_{block}"
+                m = pat_multi.match(line)
+                if m:
+                    variant = m.group(1).lower()
+                    params = "x".join(p.strip() for p in m.group(2).split(","))
+                    key = f"{variant}_{params}"
+                    seen.add(variant)
+                    variants[key] = f"{symbol_prefix}{variant}_{params}"
     except OSError:
         pass
     return variants

@@ -260,11 +260,11 @@ def resolve_method_runner(method):
 
 
 def print_result_row(name, M, N, K, ms):
-    print(f"{name:<20} {ms:>8.3f} ms  {gflops(M, N, K, ms):>8.0f} GF/s")
+    print(f"{name:<35} {ms:>8.3f} ms  {gflops(M, N, K, ms):>8.0f} GF/s")
 
 
 def print_failure_row(name, err):
-    print(f"{name:<20} FAILED    {err}")
+    print(f"{name:<35} FAILED    {err}")
 
 
 def main():

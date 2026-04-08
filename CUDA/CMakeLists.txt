@@ -9,7 +9,9 @@ execute_process(
     ERROR_QUIET
 )
 if(GPU_CC)
-    string(REPLACE "." "" CUDA_ARCH_LIST "${GPU_CC}")
+    # Handle multi-GPU: take only the first architecture
+    string(REGEX MATCH "[0-9]+\\.[0-9]+" GPU_CC_FIRST "${GPU_CC}")
+    string(REPLACE "." "" CUDA_ARCH_LIST "${GPU_CC_FIRST}")
 else()
     set(CUDA_ARCH_LIST "120")
 endif()
@@ -36,7 +38,7 @@ file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*/instantiate.cu)
 
 if(KERNEL_SOURCES)
     add_library(cuda_kernels SHARED ${KERNEL_SOURCES})
-    target_link_libraries(cuda_kernels -static-libstdc++)
+    target_link_libraries(cuda_kernels stdc++)
     set_target_properties(cuda_kernels PROPERTIES
         POSITION_INDEPENDENT_CODE ON
     )
