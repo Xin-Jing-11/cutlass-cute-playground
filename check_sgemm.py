@@ -182,16 +182,14 @@ def check_cutedsl(M, N, K, atol, rtol, variant=None):
     C_t = from_dlpack(C_d, assumed_align=16)     # (M,N):(1,M)
 
     results = []
-    for variant_name, (module_name, class_name) in sorted(CUTEDSL_VARIANTS.items()):
+    for variant_name, (gemm_cls, kwargs) in sorted(CUTEDSL_VARIANTS.items()):
         if variant is not None and variant_name != variant:
             continue
         name = f"cutedsl:{variant_name}"
         key = (variant_name, M, N, K)
         try:
             if key not in _cutedsl_compiled:
-                module = __import__(module_name, fromlist=[class_name])
-                gemm_cls = getattr(module, class_name)
-                _cutedsl_compiled[key] = cute.compile(gemm_cls(), A_t, B_t, C_t)
+                _cutedsl_compiled[key] = cute.compile(gemm_cls(**kwargs), A_t, B_t, C_t)
 
             compiled = _cutedsl_compiled[key]
             C_d.set(C)

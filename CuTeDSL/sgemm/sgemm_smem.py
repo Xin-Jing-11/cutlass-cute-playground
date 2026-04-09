@@ -27,8 +27,9 @@ class SgemmSmem:
     tiled_mma + make_tiled_copy_A/B for compute (swizzle-aware partition_S).
     """
 
-    def __init__(self, block_size=32):
+    def __init__(self, block_size=32, mc=False):
         self._block_size = block_size
+        self._mc = mc
 
     @cute.jit
     def __call__(
@@ -43,12 +44,14 @@ class SgemmSmem:
         ),
     ):
         BS = self._block_size
+        MC = self._mc
 
         # --- Swizzled sA layout via composed atom + tile_to_shape ---
         swz_B = int(math.log2(BS))
+        stride_A = (1, BS) if MC else (BS, 1)
         swizzle_atom = cute.make_composed_layout(
             cute.make_swizzle(swz_B, 0, swz_B), 0,
-            cute.make_layout((BS, BS), stride=(BS, 1)))  # row-major atom
+            cute.make_layout((BS, BS), stride=stride_A))  # row-major atom
         sA_layout = cute.tile_to_shape(swizzle_atom, (BS, BS), (0, 1))
         sB_layout = cute.make_layout((BS, BS), stride=(BS, 1))  # row-major, no swizzle
 
@@ -155,7 +158,7 @@ class SgemmSmem:
             cute.copy(g2s_B, tBgB[None, None, None, k_tile], tBsB)
             cute.arch.sync_threads()
             # inner K-loop: smem→register, then gemm
-            for k_block in cutlass.range(k_block_max):
+            for k_block in cutlass.range(k_block_max, unroll_full=True):
                 cute.copy(s2r_A, tXsA[None, None, k_block], tXrA[None, None, k_block])
                 cute.copy(s2r_B, tXsB[None, None, k_block], tXrB[None, None, k_block])
                 cute.gemm(tiled_mma, tCrC, tCrA[None, None, k_block],

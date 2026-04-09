@@ -1,17 +1,18 @@
 """
-Tiling SGEMM using CuTe DSL (TN): D = alpha * A^T * B + beta * C
+Vectorize SGEMM using CuTe DSL (TN): D = alpha * A^T * B + beta * C
 
-Register tiling: each thread computes TM x TN output elements.
-Shared memory tiling with gmem → smem → register pipeline per K-tile.
-XOR swizzle on sA via ComposedLayout + tiled_copy/tiled_mma.
+Key difference from sgemm_tiling: 128-bit (float4) vectorized gmem→smem copies.
+Swizzle is omitted because Swizzle<B,0,S> (M=0) breaks 128-bit store alignment.
+
+No MC variant: A gmem is (M,K):(K,1) so K is contiguous, but MC smem has M
+contiguous — the layout mismatch prevents vectorized stores. Use sgemm_tiling
+with mc=True instead.
 
 A stored (K,M) col-major → CuTe (M,K):(K,1).
 B stored (K,N) col-major → CuTe (N,K):(K,1).
 C stored (M,N) col-major → CuTe (M,N):(1,M).
 Float32 in/out.
 """
-
-import math
 
 import cuda.bindings.driver as cuda_driver
 
@@ -20,23 +21,21 @@ import cutlass.cute as cute
 from cutlass.cute import nvgpu
 
 
-class SgemmTiling:
+class SgemmVectorize:
     """
-    Tiling SGEMM: (BM/TM) x (BN/TN) threads per CTA.
+    Vectorize SGEMM: 128-bit gmem→smem copies, no swizzle.
+    (BM/TM) x (BN/TN) threads per CTA.
     Each thread computes TM x TN output elements.
-    tiled_copy for gmem→smem (swizzle-aware partition_D).
-    tiled_mma + make_tiled_copy_A/B for compute (swizzle-aware partition_S).
     """
 
-    def __init__(self, bm=128, bn=128, bk=16, tm=8, tn=8, mc=False):
+    def __init__(self, bm=128, bn=128, bk=16, tm=8, tn=8):
         self._bm = bm
         self._bn = bn
         self._bk = bk
         self._tm = tm
         self._tn = tn
-        self._mc = mc
         assert bm % tm == 0 and bn % tn == 0
-        assert bk >= bn // tn and bk >= bm // tm, "BK must be >= Tn and Tm"
+        assert bk % 4 == 0, "BK must be divisible by 4 for 128-bit vectorization"
 
     @cute.jit
     def __call__(
@@ -53,28 +52,30 @@ class SgemmTiling:
         BM, BN, BK = self._bm, self._bn, self._bk
         TM, TN = self._tm, self._tn
         Tm, Tn = BM // TM, BN // TN
-        MC = self._mc
+        num_threads = Tm * Tn
+        VEC = 4  # 128-bit / 32-bit = 4 floats
+        BK_VEC = BK // VEC
 
-        # --- Swizzled sA layout via composed atom + tile_to_shape ---
-        atom_M = max(BK, Tm)  # satisfy |S| >= B
-        swz_B = int(math.log2(BK))
-        swz_S = int(math.log2(atom_M))
-        stride_A = (1, atom_M) if MC else (BK, 1)
+        # --- smem layouts: plain (no swizzle), K-contiguous (row-major) ---
+        sA_layout = cute.make_layout((BM, BK), stride=(BK, 1))
+        sB_layout = cute.make_layout((BN, BK), stride=(BK, 1))
 
-        swizzle_atom = cute.make_composed_layout(
-            cute.make_swizzle(swz_B, 0, swz_S), 0,
-            cute.make_layout((atom_M, BK), stride=stride_A))  # row-major atom
-        sA_layout = cute.tile_to_shape(swizzle_atom, (BM, BK), (0, 1))
-        sB_layout = cute.make_layout((BN, BK), stride=(BK, 1))  # row-major, no swizzle
-
-        # --- gmem→smem tiled_copy ---
-        copy_atom = cute.make_copy_atom(
+        # --- gmem→smem: vectorized 128-bit copies ---
+        # Copy atom: 128 bits = 4 floats per copy
+        vec_copy_atom = cute.make_copy_atom(
             nvgpu.CopyUniversalOp(), mA.element_type,
-            num_bits_per_copy=mA.element_type.width)
-        thr_layout = cute.make_layout((Tm, Tn), stride=(Tn, 1))  # row-major
-        val_layout = cute.make_layout((1, 1))
-        tiled_copy_A = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
-        tiled_copy_B = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+            num_bits_per_copy=128)
+
+        # Thread layout tiles (M_threads, K_threads) over the (BM, BK/VEC) space
+        thr_k = BK_VEC
+        thr_m = num_threads // thr_k
+        g2s_thr_layout = cute.make_layout((thr_m, thr_k), stride=(thr_k, 1))
+        g2s_val_layout = cute.make_layout((1, VEC))  # 1 along M, VEC along K
+
+        tiled_copy_A = cute.make_tiled_copy_tv(
+            vec_copy_atom, g2s_thr_layout, g2s_val_layout)
+        tiled_copy_B = cute.make_tiled_copy_tv(
+            vec_copy_atom, g2s_thr_layout, g2s_val_layout)
 
         # --- tiled_mma: scalar FMA across (Tm, Tn) threads ---
         mma_op = cute.make_mma_atom(nvgpu.MmaUniversalOp(cutlass.Float32))
@@ -82,7 +83,7 @@ class SgemmTiling:
             mma_op,
             cute.make_layout((Tm, Tn, 1), stride=(1, Tm, 0)))
 
-        # --- smem→register copies aligned with MMA ---
+        # --- smem→register: scalar copies aligned with MMA ---
         s2r_atom = cute.make_copy_atom(
             nvgpu.CopyUniversalOp(), cutlass.Float32,
             num_bits_per_copy=cutlass.Float32.width)
@@ -98,7 +99,7 @@ class SgemmTiling:
             sA_layout, sB_layout,
         ).launch(
             grid=grid_dim,
-            block=[Tm * Tn, 1, 1],
+            block=[num_threads, 1, 1],
             stream=stream,
         )
 
@@ -115,7 +116,7 @@ class SgemmTiling:
         tiled_mma: cute.TiledMma,
         s2r_A: cute.TiledCopy,
         s2r_B: cute.TiledCopy,
-        sA_layout: cute.ComposedLayout,
+        sA_layout: cute.Layout,
         sB_layout: cute.Layout,
     ):
         BM, BN, BK = self._bm, self._bn, self._bk
@@ -135,10 +136,10 @@ class SgemmTiling:
         sA = smem.allocate_tensor(cutlass.Float32, sA_layout)
         sB = smem.allocate_tensor(cutlass.Float32, sB_layout)
 
-        # --- gmem→smem via tiled_copy (partition_D handles swizzle) ---
+        # --- gmem→smem via vectorized tiled_copy ---
         thr_g2s_a = g2s_A.get_slice(tidx)
         tAgA = thr_g2s_a.partition_S(gA)    # (CPY, CPY_M, CPY_K, k)
-        tAsA = thr_g2s_a.partition_D(sA)    # (CPY, CPY_M, CPY_K) — swizzle-aware
+        tAsA = thr_g2s_a.partition_D(sA)    # (CPY, CPY_M, CPY_K)
 
         thr_g2s_b = g2s_B.get_slice(tidx)
         tBgB = thr_g2s_b.partition_S(gB)
@@ -152,7 +153,7 @@ class SgemmTiling:
         tCrC = tiled_mma.make_fragment_C(tCgC)                      # (MMA, MMA_M, MMA_N)
         tCrC.fill(0.0)
 
-        # --- smem→register copies (partition_S handles swizzle) ---
+        # --- smem→register copies ---
         thr_s2r_a = s2r_A.get_slice(tidx)
         tXsA = thr_s2r_a.partition_S(sA)    # (CPY, MMA_M, MMA_K)
         tXrA = thr_s2r_a.retile(tCrA)       # (CPY, MMA_M, MMA_K)
@@ -165,7 +166,7 @@ class SgemmTiling:
         k_max = cute.size(tAgA, mode=[3])
         k_block_max = cute.size(tCrA, mode=[2])
         for k_tile in cutlass.range(k_max):
-            # gmem → smem
+            # gmem → smem (vectorized 128-bit copies)
             cute.copy(g2s_A, tAgA[None, None, None, k_tile], tAsA)
             cute.copy(g2s_B, tBgB[None, None, None, k_tile], tBsB)
             cute.arch.sync_threads()

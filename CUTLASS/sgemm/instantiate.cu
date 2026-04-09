@@ -89,3 +89,22 @@ INSTANTIATE_SGEMM_TILING_MC(128, 128, 16, 8, 8)
 #undef INSTANTIATE_SGEMM_TILING_MC
 #endif
 
+// sgemm_vectorize.cuh reuses sgemm_tiling_device kernel, just different copy atoms
+// Use a namespace alias to avoid symbol conflict — the host launcher name differs
+#define INSTANTIATE_SGEMM_VECTORIZE(BM, BN, BK, TM, TN)                          \
+  extern "C" void cutlass_sgemm_vectorize_##BM##x##BN##x##BK##x##TM##x##TN(      \
+      int m, int n, int k,                                                         \
+      float alpha,                                                                 \
+      const float* A, int ldA,                                                     \
+      const float* B, int ldB,                                                     \
+      float beta,                                                                  \
+      float* C, int ldC) {                                                         \
+    sgemm_vectorize<BM, BN, BK, TM, TN>(m, n, k, alpha, A, ldA, B, ldB,          \
+                                          beta, C, ldC);                           \
+  }
+
+INSTANTIATE_SGEMM_VECTORIZE(64, 64, 16, 8, 8)
+INSTANTIATE_SGEMM_VECTORIZE(128, 128, 16, 8, 8)
+
+#undef INSTANTIATE_SGEMM_VECTORIZE
+

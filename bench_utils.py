@@ -46,17 +46,8 @@ def _discover_cpp_variants(instantiate_path, symbol_prefix):
 
 
 def _discover_cutedsl_variants():
-    variants = {}
-    root = os.path.dirname(os.path.abspath(__file__))
-    for path in sorted(glob.glob(os.path.join(root, "CuTeDSL", "sgemm", "sgemm_*.py"))):
-        module_basename = os.path.splitext(os.path.basename(path))[0]  # sgemm_xxx
-        if not module_basename.startswith("sgemm_"):
-            continue
-        variant = module_basename[len("sgemm_"):]
-        class_name = _variant_class_name("Sgemm", variant)
-        module_name = f"CuTeDSL.sgemm.{module_basename}"
-        variants[variant] = (module_name, class_name)
-    return variants
+    from CuTeDSL.sgemm.instantiate import VARIANTS
+    return VARIANTS
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))

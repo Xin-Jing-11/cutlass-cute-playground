@@ -82,3 +82,34 @@ INSTANTIATE_SGEMM_TILING_MC(128, 128, 16, 8, 8)
 #undef INSTANTIATE_SGEMM_TILING_MC
 #endif
 
+#define INSTANTIATE_SGEMM_VECTORIZE(BM, BN, BK, TM, TN)                          \
+  extern "C" void cuda_sgemm_vectorize_##BM##x##BN##x##BK##x##TM##x##TN(       \
+      int M, int N, int K,                                                       \
+      float alpha,                                                               \
+      const float* A, const float* B,                                            \
+      float beta,                                                                \
+      float* C) {                                                                 \
+    sgemm_vectorize<BM, BN, BK, TM, TN>(M, N, K, alpha, A, B, beta, C);       \
+  }
+
+INSTANTIATE_SGEMM_VECTORIZE(64, 64, 16, 8, 8)
+INSTANTIATE_SGEMM_VECTORIZE(128, 128, 16, 8, 8)
+
+#undef INSTANTIATE_SGEMM_VECTORIZE
+
+#if 1  // M-contiguous As layout variant
+#define INSTANTIATE_SGEMM_VECTORIZE_MC(BM, BN, BK, TM, TN)                          \
+  extern "C" void cuda_sgemm_vectorize_mc_##BM##x##BN##x##BK##x##TM##x##TN(       \
+      int M, int N, int K,                                                           \
+      float alpha,                                                                   \
+      const float* A, const float* B,                                                \
+      float beta,                                                                    \
+      float* C) {                                                                     \
+    sgemm_vectorize<BM, BN, BK, TM, TN, true>(M, N, K, alpha, A, B, beta, C);     \
+  }
+
+INSTANTIATE_SGEMM_VECTORIZE_MC(64, 64, 16, 8, 8)
+INSTANTIATE_SGEMM_VECTORIZE_MC(128, 128, 16, 8, 8)
+
+#undef INSTANTIATE_SGEMM_VECTORIZE_MC
+#endif

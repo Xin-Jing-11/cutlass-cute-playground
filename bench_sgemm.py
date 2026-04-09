@@ -202,15 +202,13 @@ def bench_cutedsl(M, N, K, warmup=5, iters=20):
     C_t = from_dlpack(C_d, assumed_align=16)     # (M,N):(1,M)
 
     results = []
-    for variant_name, (module_name, class_name) in sorted(CUTEDSL_VARIANTS.items()):
+    for variant_name, (gemm_cls, kwargs) in sorted(CUTEDSL_VARIANTS.items()):
         name = f"cutedsl:{variant_name}"
         key = (variant_name, M, N, K)
         try:
             def compile_fn():
                 if key not in _cutedsl_compiled:
-                    module = __import__(module_name, fromlist=[class_name])
-                    gemm_cls = getattr(module, class_name)
-                    _cutedsl_compiled[key] = cute.compile(gemm_cls(), A_t, B_t, C_t)
+                    _cutedsl_compiled[key] = cute.compile(gemm_cls(**kwargs), A_t, B_t, C_t)
 
                 compiled = _cutedsl_compiled[key]
                 return lambda: compiled(A_t, B_t, C_t)
@@ -245,8 +243,8 @@ def parse_args():
     parser.add_argument("--m", type=int, default=None, help="Problem size M")
     parser.add_argument("--n", type=int, default=None, help="Problem size N")
     parser.add_argument("--k", type=int, default=None, help="Problem size K")
-    parser.add_argument("--method", choices=sorted(BENCH_REGISTRY.keys()), default="cuda",
-                        help="Implementation family to benchmark against cuBLAS")
+    parser.add_argument("--method", choices=["all", *sorted(BENCH_REGISTRY.keys())], default="all",
+                        help="Implementation family to benchmark against cuBLAS (default: all)")
     parser.add_argument("--iters", type=int, default=20, help="Benchmark iterations")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations")
     return parser.parse_args()
@@ -275,7 +273,8 @@ def print_failure_row(name, err):
 def main():
     args = parse_args()
     M, N, K = resolve_problem_shape(args)
-    method_runner = resolve_method_runner(args.method)
+
+    methods = sorted(METHOD_RUNNERS.keys()) if args.method == "all" else [args.method]
 
     print("SGEMM Benchmark (FP32 in/out, FP32 accumulator)")
     print(f"Problem: M={M}, N={N}, K={K}")
@@ -288,10 +287,15 @@ def main():
         print_failure_row("cuBLAS", err)
         return
 
-    impl_results = method_runner(M, N, K, warmup=args.warmup, iters=args.iters)
+    all_results = []
+    for method in methods:
+        runner = resolve_method_runner(method)
+        all_results.extend(runner(M, N, K, warmup=args.warmup, iters=args.iters))
+
+    all_results.sort(key=lambda item: float("inf") if item[1] is None else item[1])
 
     print_result_row("cuBLAS", M, N, K, cublas_ms)
-    for name, ms, err in impl_results:
+    for name, ms, err in all_results:
         if err is None:
             print_result_row(name, M, N, K, ms)
         else:
