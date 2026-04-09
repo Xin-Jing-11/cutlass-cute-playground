@@ -80,7 +80,8 @@ void sgemm_smem_device(
 
 // SGEMM: C = alpha * A^T * B + beta * C  (float32 in/out)
 // A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
-template <int BLOCK_SIZE = 32>
+// MC: false = K-contiguous As (LayoutRight), true = M-contiguous As (LayoutLeft)
+template <int BLOCK_SIZE = 32, bool MC = false>
 void sgemm_smem(
     int m, int n, int k,
     float alpha,
@@ -103,11 +104,8 @@ void sgemm_smem(
     auto tB = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{});
     auto tC = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
 
-    // define smem layout via swizzle atom + tile_to_shape (same pattern as sgemm_tiling)
+    // swizzle atom: KC uses LayoutRight (K fast), MC uses LayoutLeft (M fast)
     constexpr int SWZ_B = __builtin_ctz(BLOCK_SIZE);
-    auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_B>{},
-        make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{}));
-    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
     auto sB_layout = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{});
     auto sC_layout = make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
 
@@ -115,11 +113,25 @@ void sgemm_smem(
     dim3 grid_size(size(ceil_div(m, Int<BLOCK_SIZE>{})),
                    size(ceil_div(n, Int<BLOCK_SIZE>{})));
 
-    sgemm_smem_device<<<grid_size, block_size>>>(
-        shape_MNK, cta_tiler,
-        alpha,
-        A, dA, tA, sA_layout, 
-        B, dB, tB, sB_layout, 
-        beta,
-        C, dC, tC, sC_layout);
+    if constexpr (MC) {
+        auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_B>{},
+            make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{})));  // LayoutLeft: M contiguous
+        auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
+
+        sgemm_smem_device<<<grid_size, block_size>>>(
+            shape_MNK, cta_tiler, alpha,
+            A, dA, tA, sA_layout,
+            B, dB, tB, sB_layout,
+            beta, C, dC, tC, sC_layout);
+    } else {
+        auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_B>{},
+            make_layout(make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}), LayoutRight{}));  // K contiguous
+        auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BLOCK_SIZE>{}, Int<BLOCK_SIZE>{}));
+
+        sgemm_smem_device<<<grid_size, block_size>>>(
+            shape_MNK, cta_tiler, alpha,
+            A, dA, tA, sA_layout,
+            B, dB, tB, sB_layout,
+            beta, C, dC, tC, sC_layout);
+    }
 }

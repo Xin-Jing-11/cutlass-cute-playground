@@ -112,7 +112,8 @@ void sgemm_tiling_device(
 }
 
 // Host launcher
-template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8>
+// MC: false = K-contiguous As (LayoutRight), true = M-contiguous As (LayoutLeft)
+template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8, bool MC = false>
 void sgemm_tiling(
     int m, int n, int k,
     float alpha,
@@ -136,15 +137,10 @@ void sgemm_tiling(
     constexpr int Tn = BN / TN;
 
     // --- Swizzled smem layouts via tile_to_shape ---
-    // Atom: (atom_M, BK) row-major with swizzle; atom_M = max(BK, Tm) to satisfy |S| >= B
     constexpr int atom_M = (Tm >= BK) ? Tm : BK;
-    constexpr int SWZ_B = __builtin_ctz(BK);       // log2(BK), e.g. 4 for BK=16
-    constexpr int SWZ_S = __builtin_ctz(atom_M);   // log2(atom_M), must be >= SWZ_B
-    auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_S>{},
-        make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
-    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
+    constexpr int SWZ_B = __builtin_ctz(BK);
+    constexpr int SWZ_S = __builtin_ctz(atom_M);
     auto sB_layout = make_layout(make_shape(Int<BN>{}, Int<BK>{}), LayoutRight{});
-
     auto sC_layout = make_layout(make_shape(Int<BM>{}, Int<BN>{}));
 
     // --- gmem→smem tiled_copy ---
@@ -169,11 +165,27 @@ void sgemm_tiling(
     dim3 grid_size(size(ceil_div(m, Int<BM>{})),
                    size(ceil_div(n, Int<BN>{})));
 
-    sgemm_tiling_device<<<grid_size, block_size>>>(
-        shape_MNK, cta_tiler,
-        alpha,
-        A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
-        B, dB, g2s_copy_B, s2r_copy_B, sB_layout,
-        beta,
-        C, dC, mma, sC_layout);
+    if constexpr (MC) {
+        // M-contiguous: LayoutLeft (M fast)
+        auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_S>{},
+            make_layout(make_shape(Int<atom_M>{}, Int<BK>{})));
+        auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
+
+        sgemm_tiling_device<<<grid_size, block_size>>>(
+            shape_MNK, cta_tiler, alpha,
+            A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
+            B, dB, g2s_copy_B, s2r_copy_B, sB_layout,
+            beta, C, dC, mma, sC_layout);
+    } else {
+        // K-contiguous: LayoutRight (K fast)
+        auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_S>{},
+            make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
+        auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
+
+        sgemm_tiling_device<<<grid_size, block_size>>>(
+            shape_MNK, cta_tiler, alpha,
+            A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
+            B, dB, g2s_copy_B, s2r_copy_B, sB_layout,
+            beta, C, dC, mma, sC_layout);
+    }
 }

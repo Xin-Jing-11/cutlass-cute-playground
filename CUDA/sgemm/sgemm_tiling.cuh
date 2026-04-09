@@ -5,15 +5,16 @@
 /*
  * TILING SGEMM (TN): C = alpha * A^T * B + beta * C
  * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
- * 
+ *
  * BM, BN, BK: tile size for M, N, K dimension
  * TM, TN: tile size for thread local register
- * 
+ * MC: false = K-contiguous As[m*BK+k] (default), true = M-contiguous As[k*BM+m]
+ *
  * # of gmem load: MNK * (1/BM + 1/BN)
  * # of smem load: MNK * (1/TM + 1/TN)
  */
 
-template <int BM = 32, int BN = 32, int BK = 8, int TM = 8, int TN = 8>
+template <int BM = 32, int BN = 32, int BK = 8, int TM = 8, int TN = 8, bool MC = false>
 __global__ void sgemm_tiling_kernel(
     int M, int N, int K,
     float alpha,
@@ -24,56 +25,56 @@ __global__ void sgemm_tiling_kernel(
 {
     assert(is_pow2(M) && is_pow2(N) && is_pow2(K));
     assert(BM % TM == 0 && BN % TN == 0);
-    
+
     // for gmem access
-    int bm = blockIdx.x * BM; 
+    int bm = blockIdx.x * BM;
     int bn = blockIdx.y * BN;
+    
+    // advance gmem pointer
+    A += bm * K;
+    B += bn * K;
 
-    // advance gmem pointer 
-    A += bm * K; // (bm, 0)
-    B += bn * K; // (0, bn)
+    // for local access
+    constexpr int Tm = BM / TM;
+    int tx = threadIdx.x % Tm;
+    int ty = threadIdx.x / Tm;
 
-    // for local access 
-    constexpr int Tm = BM / TM; // # of thread in M dimension
-    // int Tn = BN / TN; // # of thread in N dimension
-
-    int tx = threadIdx.x % Tm; // [0, BM/TM)
-    int ty = threadIdx.x / Tm; // [0, BN/TN)
-
-    // for loading shared memory
-    constexpr int iterA = BK * TM * TN / BN; // number of iterations loaded by each thread 
-    int idxAm = threadIdx.x / BK;
+    // iterations for storing smem 
+    constexpr int iterA = BK * TM * TN / BN;
     int idxAk = threadIdx.x % BK;
+    int idxAm = threadIdx.x / BK;
     int nrowsA = blockDim.x / BK;
 
-    constexpr int iterB = BK * TM * TN / BM; // number of iterations loaded by each thread 
+    constexpr int iterB = BK * TM * TN / BM;
     int idxBk = threadIdx.x % BK;
     int idxBn = threadIdx.x / BK;
     int ncolsB = blockDim.x / BK;
 
-    // shared memory 
+    // shared memory
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
 
-    // swizzle functions to reduce bank conflict
-    // S must match where the thread-varying bits are in each smem's linear index
-    // As[m * BK + k]: threads vary in m with stride TM → varying bit at log2(BK*TM)
-    constexpr int SWZ_B = __builtin_ctz(BK);
-    constexpr int SWZ_S = __builtin_ctz(BK * TM);
+    // swizzle parameters depend on layout
+    // KC: As[m*BK+k], reads vary in m with stride TM*BK → swizzle from m-bits
+    // MC: As[k*BM+m], reads vary in m with stride TM   → swizzle from k-bits
+    constexpr int SWZ_B = MC ? __builtin_ctz(TM) : __builtin_ctz(BK);
+    constexpr int SWZ_S = MC ? __builtin_ctz(BM)  : __builtin_ctz(BK * TM);
     auto swzA = [](int idx) { return swizzle<SWZ_B, 0, SWZ_S>(idx); };
 
-    // accumulator in register 
     float accum[TM * TN] = {0.0f};
-    // register cache for tile of A and B
     float regM[TM] = {0.0f};
     float regN[TN] = {0.0f};
 
     for (int bk = 0; bk < K; bk += BK) {
-        // load shared memory
+        // load smem 
         #pragma unroll
         for (int i = 0; i < iterA; i++) {
             int m = idxAm + i * nrowsA;
-            As[swzA(m * BK + idxAk)] = A[m * K + idxAk];
+            if constexpr (MC) {
+                As[swzA(idxAk * BM + m)] = A[m * K + idxAk];
+            } else {
+                As[swzA(m * BK + idxAk)] = A[m * K + idxAk];
+            }
         }
 
         #pragma unroll
@@ -84,22 +85,26 @@ __global__ void sgemm_tiling_kernel(
         __syncthreads();
 
         // advance gmem pointer
-        A += BK; // (bm, bk)
-        B += BK; // (bk, bn)
+        A += BK;
+        B += BK;
 
+        // compute
         #pragma unroll
         for (int k = 0; k < BK; k++) {
-            // load tile into register
+            // load into register from smem 
             #pragma unroll
             for (int i = 0; i < TM; i++) {
-                regM[i] = As[swzA((tx * TM + i) * BK + k)];
+                if constexpr (MC) {
+                    regM[i] = As[swzA(k * BM + tx * TM + i)];
+                } else {
+                    regM[i] = As[swzA((tx * TM + i) * BK + k)];
+                }
             }
             #pragma unroll
             for (int j = 0; j < TN; j++) {
                 regN[j] = Bs[k + (ty * TN + j) * BK];
             }
 
-            // compute
             #pragma unroll
             for (int j = 0; j < TN; j++) {
                 #pragma unroll
@@ -111,16 +116,17 @@ __global__ void sgemm_tiling_kernel(
         __syncthreads();
     }
 
-    // epilogue: write back to gmem
-    C += bm + tx * TM + (bn + ty * TN) * M; // (bm + tx*TM, bn + ty*TN)
+    C += bm + tx * TM + (bn + ty * TN) * M;
+    #pragma unroll
     for (int j = 0; j < TN; j++) {
+        #pragma unroll
         for (int i = 0; i < TM; i++) {
             C[i + j * M] = alpha * accum[i + j * TM] + beta * C[i + j * M];
         }
     }
 }
 
-template <int BM = 32, int BN = 32, int BK = 8, int TM = 8, int TN = 8>
+template <int BM = 32, int BN = 32, int BK = 8, int TM = 8, int TN = 8, bool MC = false>
 void sgemm_tiling(
     int M, int N, int K,
     float alpha,
@@ -130,5 +136,5 @@ void sgemm_tiling(
 {
     dim3 block(BM * BN / (TM * TN));
     dim3 grid(CEIL_DIV(M, BM), CEIL_DIV(N, BN));
-    sgemm_tiling_kernel<BM, BN, BK, TM, TN><<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+    sgemm_tiling_kernel<BM, BN, BK, TM, TN, MC><<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
 }
