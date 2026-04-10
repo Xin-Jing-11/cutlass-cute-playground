@@ -36,6 +36,7 @@ __global__ void sgemm_tiling_kernel(
 
     // for local access
     constexpr int Tm = BM / TM;
+    constexpr int Tn = BN / TN;
     int tx = threadIdx.x % Tm;
     int ty = threadIdx.x / Tm;
 
@@ -54,11 +55,11 @@ __global__ void sgemm_tiling_kernel(
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
 
-    // swizzle parameters depend on layout
-    // KC: As[m*BK+k], reads vary in m with stride TM*BK → swizzle from m-bits
-    // MC: As[k*BM+m], reads vary in m with stride TM   → swizzle from k-bits
-    constexpr int SWZ_B = MC ? __builtin_ctz(TM) : __builtin_ctz(BK);
-    constexpr int SWZ_S = MC ? __builtin_ctz(BM)  : __builtin_ctz(BK * TM);
+    // swizzle parameters depend on layout (stride-1 thread mapping: m = tx + i*Tm)
+    // KC: As[m*BK+k], k at bits[0..ctz(BK)), tx at bits[ctz(BK)...) → XOR k with tx
+    // MC: As[k*BM+m], tx at bits[0..ctz(Tm)), k at bits[ctz(BM)...) → XOR m with k
+    constexpr int SWZ_B = __builtin_ctz(BK);
+    constexpr int SWZ_S = MC ? __builtin_ctz(BM) : __builtin_ctz(BK);
     auto swzA = [](int idx) { return swizzle<SWZ_B, 0, SWZ_S>(idx); };
 
     float accum[TM * TN] = {0.0f};
@@ -95,14 +96,14 @@ __global__ void sgemm_tiling_kernel(
             #pragma unroll
             for (int i = 0; i < TM; i++) {
                 if constexpr (MC) {
-                    regM[i] = As[swzA(k * BM + tx * TM + i)];
+                    regM[i] = As[swzA(k * BM + tx + i * Tm)];
                 } else {
-                    regM[i] = As[swzA((tx * TM + i) * BK + k)];
+                    regM[i] = As[swzA((tx + i * Tm) * BK + k)];
                 }
             }
             #pragma unroll
             for (int j = 0; j < TN; j++) {
-                regN[j] = Bs[k + (ty * TN + j) * BK];
+                regN[j] = Bs[k + (ty + j * Tn) * BK];
             }
 
             #pragma unroll
@@ -116,12 +117,12 @@ __global__ void sgemm_tiling_kernel(
         __syncthreads();
     }
 
-    C += bm + tx * TM + (bn + ty * TN) * M;
+    C += bm + tx + (bn + ty) * M;
     #pragma unroll
     for (int j = 0; j < TN; j++) {
         #pragma unroll
         for (int i = 0; i < TM; i++) {
-            C[i + j * M] = alpha * accum[i + j * TM] + beta * C[i + j * M];
+            C[i * Tm + j * Tn * M] = alpha * accum[i + j * TM] + beta * C[i * Tm + j * Tn * M];
         }
     }
 }

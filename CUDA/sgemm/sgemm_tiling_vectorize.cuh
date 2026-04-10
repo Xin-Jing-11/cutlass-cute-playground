@@ -3,7 +3,7 @@
 #include "../share.cuh"
 
 /*
- * VECTORIZE SGEMM (TN): C = alpha * A^T * B + beta * C
+ * TILING VECTORIZE SGEMM (TN): C = alpha * A^T * B + beta * C
  * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  *
  * BM, BN, BK: tile size for M, N, K dimension
@@ -23,7 +23,7 @@
  */
 
 template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8, bool MC = false>
-__global__ void sgemm_vectorize_kernel(
+__global__ void sgemm_tiling_vectorize_kernel(
     int M, int N, int K,
     float alpha,
     const float* __restrict__ A,
@@ -44,6 +44,7 @@ __global__ void sgemm_vectorize_kernel(
 
     // for local access
     constexpr int Tm = BM / TM;
+    constexpr int Tn = BN / TN;
     int tx = threadIdx.x % Tm;
     int ty = threadIdx.x / Tm;
 
@@ -68,11 +69,11 @@ __global__ void sgemm_vectorize_kernel(
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
 
-    // swizzle parameters depend on layout
-    // KC: As[m*BK+k], reads vary in m with stride TM*BK → swizzle from m-bits
-    // MC: As[k*BM+m], reads vary in m with stride TM   → swizzle from k-bits
-    constexpr int SWZ_B = MC ? __builtin_ctz(TM) : __builtin_ctz(BK);
-    constexpr int SWZ_S = MC ? __builtin_ctz(BM)  : __builtin_ctz(BK * TM);
+    // swizzle parameters depend on layout (stride-1 thread mapping: m = tx + i*Tm)
+    // KC: As[m*BK+k], k at bits[0..ctz(BK)), tx at bits[ctz(BK)...) → XOR k with tx
+    // MC: As[k*BM+m], tx at bits[0..ctz(Tm)), k at bits[ctz(BM)...) → XOR m with k
+    constexpr int SWZ_B = __builtin_ctz(BK);
+    constexpr int SWZ_S = MC ? __builtin_ctz(BM) : __builtin_ctz(BK);
     auto swzA = [](int idx) { return swizzle<SWZ_B, 0, SWZ_S>(idx); };
 
     float accum[TM * TN] = {0.0f};
@@ -116,14 +117,14 @@ __global__ void sgemm_vectorize_kernel(
             #pragma unroll
             for (int i = 0; i < TM; i++) {
                 if constexpr (MC) {
-                    regM[i] = As[swzA(k * BM + (tx * TM + i))];
+                    regM[i] = As[swzA(k * BM + tx + i * Tm)];
                 } else {
-                    regM[i] = As[swzA((tx * TM + i) * BK + k)];
+                    regM[i] = As[swzA((tx + i * Tm) * BK + k)];
                 }
             }
             #pragma unroll
             for (int j = 0; j < TN; j++) {
-                regN[j] = Bs[k + (ty * TN + j) * BK];
+                regN[j] = Bs[k + (ty + j * Tn) * BK];
             }
 
             #pragma unroll
@@ -137,21 +138,21 @@ __global__ void sgemm_vectorize_kernel(
         __syncthreads();
     }
 
-    C += bm + tx * TM + (bn + ty * TN) * M;
+    C += bm + tx + (bn + ty) * M;
     #pragma unroll
     for (int j = 0; j < TN; j++) {
         #pragma unroll
         for (int i = 0; i < TM; i++) {
-            C[i + j * M] = alpha * accum[i + j * TM] + beta * C[i + j * M];
+            C[i * Tm + j * Tn * M] = alpha * accum[i + j * TM] + beta * C[i * Tm + j * Tn * M];
         }
     }
 }
 
 template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8, bool MC = false>
-void sgemm_vectorize(int M, int N, int K, float alpha,
+void sgemm_tiling_vectorize(int M, int N, int K, float alpha,
     const float* A, const float* B, float beta, float* C)
 {
     dim3 block(BM * BN / (TM * TN));
     dim3 grid(CEIL_DIV(M, BM), CEIL_DIV(N, BN));
-    sgemm_vectorize_kernel<BM, BN, BK, TM, TN, MC><<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+    sgemm_tiling_vectorize_kernel<BM, BN, BK, TM, TN, MC><<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
 }

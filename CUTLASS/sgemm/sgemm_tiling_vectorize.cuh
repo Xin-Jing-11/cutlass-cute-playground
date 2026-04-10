@@ -21,7 +21,7 @@ template <class ProblemShape, class CtaTiler,
     class CStride, class TiledMMA, class CSmemLayout>
 __global__ static
 __launch_bounds__(decltype(size(TiledMMA{}))::value)
-void sgemm_vectorize_device(
+void sgemm_tiling_vectorize_device(
     ProblemShape shape_MNK, CtaTiler cta_tiler,
     float alpha,
     const float* A, AStride dA, TiledCopyA g2s_A, S2RCopyA s2r_A, ASmemLayout sA_layout,
@@ -116,7 +116,7 @@ void sgemm_vectorize_device(
 
 // Host launcher
 template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8>
-void sgemm_vectorize(
+void sgemm_tiling_vectorize(
     int m, int n, int k,
     float alpha,
     const float* A, int ldA,
@@ -179,7 +179,7 @@ void sgemm_vectorize(
     dim3 grid_size(size(ceil_div(m, Int<BM>{})),
                    size(ceil_div(n, Int<BN>{})));
 
-    sgemm_vectorize_device<<<grid_size, block_size>>>(
+    sgemm_tiling_vectorize_device<<<grid_size, block_size>>>(
         shape_MNK, cta_tiler, alpha,
         A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
         B, dB, g2s_copy_B, s2r_copy_B, sB_layout,

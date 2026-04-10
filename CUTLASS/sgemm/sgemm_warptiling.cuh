@@ -4,14 +4,13 @@
 #include <cute/atom/mma_atom.hpp>
 
 /*
- * Tiling SGEMM using CuTe: D = alpha * A^T * B + beta * C   (TN layout)
+ * Warptiling SGEMM using CuTe: D = alpha * A^T * B + beta * C   (TN layout)
  * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  *
- * Full CuTe pattern matching sgemm_sm80.cu:
- *   - tiled_copy for gmem→smem (partition_D handles swizzle)
- *   - tiled_mma for compute (partition_fragment_A/B)
- *   - make_tiled_copy_A/B for smem→register (partition_S handles swizzle)
- *   - Swizzle in ComposedLayout via tile_to_shape
+ * Same device kernel as sgemm_tiling, only the host launcher differs:
+ *   - Hierarchical thread layout: ((NTM, NWM), (NTN, NWN)) encodes warp structure
+ *   - Each thread computes TM*WMITER × TN*WNITER output elements
+ *   - CuTe's partition_fragment automatically handles subtile iteration
  */
 
 template <class ProblemShape, class CtaTiler,
@@ -20,7 +19,7 @@ template <class ProblemShape, class CtaTiler,
     class CStride, class TiledMMA, class CSmemLayout>
 __global__ static
 __launch_bounds__(decltype(size(TiledMMA{}))::value)
-void sgemm_tiling_device(
+void sgemm_warptiling_device(
     ProblemShape shape_MNK, CtaTiler cta_tiler,
     float alpha,
     const float* A, AStride dA, TiledCopyA g2s_A, S2RCopyA s2r_A, ASmemLayout sA_layout,
@@ -113,8 +112,11 @@ void sgemm_tiling_device(
 
 // Host launcher
 // MC: false = K-contiguous As (LayoutRight), true = M-contiguous As (LayoutLeft)
-template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8, bool MC = false>
-void sgemm_tiling(
+template <int BM = 128, int BN = 128, int BK = 16,
+    int WM = 64, int WN = 64,
+    int WMITER = 1, int WNITER = 4,
+    int TM = 8, int TN = 4, bool MC = false>
+void sgemm_warptiling(
     int m, int n, int k,
     float alpha,
     const float* A, int ldA,
@@ -124,7 +126,8 @@ void sgemm_tiling(
 {
     using namespace cute;
 
-    static_assert(BM % TM == 0 && BN % TN == 0, "BM/BN must be divisible by TM/TN");
+    static_assert(BM % WM == 0 && BN % WN == 0, "BM/BN must be divisible by WM/WN");
+    static_assert(WM % (WMITER * TM) == 0 && WN % (WNITER * TN) == 0);
 
     auto cta_tiler = make_shape(Int<BM>{}, Int<BN>{}, Int<BK>{});
     auto shape_MNK = make_shape(m, n, k);
@@ -133,11 +136,18 @@ void sgemm_tiling(
     auto dB = make_stride(ldB, Int<1>{});
     auto dC = make_stride(Int<1>{}, ldC);
 
-    constexpr int Tm = BM / TM;
-    constexpr int Tn = BN / TN;
+    constexpr int NWM = BM / WM;
+    constexpr int NWN = BN / WN;
+    constexpr int WSUBM = WM / WMITER;
+    constexpr int WSUBN = WN / WNITER;
+    constexpr int NTM = WSUBM / TM;
+    constexpr int NTN = WSUBN / TN;
+    static_assert(NTM * NTN == 32, "warp size must be 32");
+    constexpr int NUM_THREADS = NWM * NWN * 32;
 
     // --- Swizzled smem layouts via tile_to_shape ---
-    constexpr int atom_M = (Tm >= BK) ? Tm : BK;
+    constexpr int THR_M = NTM * NWM;  // thread positions in M
+    constexpr int atom_M = (THR_M >= BK) ? THR_M : BK;
     constexpr int SWZ_B = __builtin_ctz(BK);
     constexpr int SWZ_S = __builtin_ctz(atom_M);
 
@@ -153,22 +163,27 @@ void sgemm_tiling(
             return tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
         }
     }();
-
+    
     auto sB_layout = make_layout(make_shape(Int<BN>{}, Int<BK>{}), LayoutRight{});
     auto sC_layout = make_layout(make_shape(Int<BM>{}, Int<BN>{}));
 
     // --- gmem→smem tiled_copy ---
     using G2SCopyAtom = Copy_Atom<UniversalCopy<float>, float>;
     auto g2s_copy_A = make_tiled_copy(G2SCopyAtom{},
-        make_layout(make_shape(Int<Tm>{}, Int<Tn>{}), LayoutRight{}),
+        make_layout(make_shape(Int<THR_M>{}, Int<NUM_THREADS / THR_M>{}), LayoutRight{}),
         make_layout(make_shape(Int<1>{}, Int<1>{})));
     auto g2s_copy_B = make_tiled_copy(G2SCopyAtom{},
-        make_layout(make_shape(Int<Tm>{}, Int<Tn>{}), LayoutRight{}),
+        make_layout(make_shape(Int<THR_M>{}, Int<NUM_THREADS / THR_M>{}), LayoutRight{}),
         make_layout(make_shape(Int<1>{}, Int<1>{})));
 
-    // --- tiled_mma: scalar FMA tiled across (Tm, Tn) threads ---
+    // --- tiled_mma: warp-structured thread layout ---
+    // threadIdx = thrIdm + thrIdn*NTM + warpIdm*32 + warpIdn*NWM*32
+    // m-pos: (thrIdm, warpIdm), n-pos: (thrIdn, warpIdn)
     auto mma = make_tiled_mma(UniversalFMA<float, float, float, float>{},
-                              Layout<Shape<Int<Tm>, Int<Tn>, _1>>{});
+        make_layout(
+            make_shape(make_shape(Int<NTM>{}, Int<NWM>{}), make_shape(Int<NTN>{}, Int<NWN>{})),
+            make_stride(make_stride(Int<1>{}, Int<NTM * NTN>{}), make_stride(Int<NTM>{}, Int<NWM * NTM * NTN>{}))
+        ));
 
     // --- smem→register copies aligned with MMA ---
     using S2RCopyAtom = Copy_Atom<UniversalCopy<float>, float>;
@@ -179,7 +194,7 @@ void sgemm_tiling(
     dim3 grid_size(size(ceil_div(m, Int<BM>{})),
                    size(ceil_div(n, Int<BN>{})));
 
-    sgemm_tiling_device<<<grid_size, block_size>>>(
+    sgemm_warptiling_device<<<grid_size, block_size>>>(
         shape_MNK, cta_tiler, alpha,
         A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
         B, dB, g2s_copy_B, s2r_copy_B, sB_layout,

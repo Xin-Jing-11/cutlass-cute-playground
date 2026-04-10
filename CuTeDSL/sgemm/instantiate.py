@@ -12,7 +12,7 @@
 from CuTeDSL.sgemm.sgemm_naive import SgemmNaive
 from CuTeDSL.sgemm.sgemm_smem import SgemmSmem
 from CuTeDSL.sgemm.sgemm_tiling import SgemmTiling
-from CuTeDSL.sgemm.sgemm_vectorization import SgemmVectorize
+from CuTeDSL.sgemm.sgemm_tiling_vectorize import SgemmTilingVectorize
 
 VARIANTS = {
     # naive
@@ -28,7 +28,7 @@ VARIANTS = {
     "tiling_mc_64x64x8x8x8":        (SgemmTiling, dict(bm=64, bn=64, bk=8, tm=8, tn=8, mc=True)),
     "tiling_mc_128x128x16x8x8":     (SgemmTiling, dict(bm=128, bn=128, bk=16, tm=8, tn=8, mc=True)),
 
-    # vectorize (128-bit g2s, no swizzle, no MC — see sgemm_vectorization.py)
-    "vectorize_64x64x16x8x8":       (SgemmVectorize, dict(bm=64, bn=64, bk=16, tm=8, tn=8)),
-    "vectorize_128x128x16x8x8":     (SgemmVectorize, dict(bm=128, bn=128, bk=16, tm=8, tn=8)),
+    # tiling_vectorize (128-bit g2s, no swizzle, no MC — see sgemm_tiling_vectorize.py)
+    "tiling_vectorize_64x64x16x8x8":       (SgemmTilingVectorize, dict(bm=64, bn=64, bk=16, tm=8, tn=8)),
+    "tiling_vectorize_128x128x16x8x8":     (SgemmTilingVectorize, dict(bm=128, bn=128, bk=16, tm=8, tn=8)),
 }

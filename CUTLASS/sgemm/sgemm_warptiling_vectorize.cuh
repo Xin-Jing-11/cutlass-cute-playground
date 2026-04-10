@@ -4,14 +4,14 @@
 #include <cute/atom/mma_atom.hpp>
 
 /*
- * Tiling SGEMM using CuTe: D = alpha * A^T * B + beta * C   (TN layout)
+ * Warptiling Vectorize SGEMM using CuTe: D = alpha * A^T * B + beta * C   (TN layout)
  * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  *
- * Full CuTe pattern matching sgemm_sm80.cu:
- *   - tiled_copy for gmem→smem (partition_D handles swizzle)
- *   - tiled_mma for compute (partition_fragment_A/B)
- *   - make_tiled_copy_A/B for smem→register (partition_S handles swizzle)
- *   - Swizzle in ComposedLayout via tile_to_shape
+ * Combines warptiling thread layout with 128-bit vectorized gmem→smem copies.
+ * Swizzle is omitted because Swizzle<B,0,S> (M=0) breaks 128-bit store alignment.
+ *
+ * No MC variant: A gmem is (M,K):(K,1) so K is contiguous, but MC smem has M
+ * contiguous — the layout mismatch prevents vectorized stores.
  */
 
 template <class ProblemShape, class CtaTiler,
@@ -20,7 +20,7 @@ template <class ProblemShape, class CtaTiler,
     class CStride, class TiledMMA, class CSmemLayout>
 __global__ static
 __launch_bounds__(decltype(size(TiledMMA{}))::value)
-void sgemm_tiling_device(
+void sgemm_warptiling_vectorize_device(
     ProblemShape shape_MNK, CtaTiler cta_tiler,
     float alpha,
     const float* A, AStride dA, TiledCopyA g2s_A, S2RCopyA s2r_A, ASmemLayout sA_layout,
@@ -40,16 +40,16 @@ void sgemm_tiling_device(
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{}); // BN x BK x k
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // BM x BN
 
-    // allocate smem — cosize from the outer (plain) layout of the composition
-    __shared__ __align__(128) float smemA[cosize_v<decltype(sA_layout.layout_b())>];
+    // allocate smem — plain layouts (no swizzle), cosize_v works directly
+    __shared__ __align__(128) float smemA[cosize_v<ASmemLayout>];
     __shared__ __align__(128) float smemB[cosize_v<BSmemLayout>];
-    Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // swizzled ComposedLayout
-    Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout); // swizzled ComposedLayout
+    Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);
+    Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);
 
     // --- gmem→smem via tiled_copy ---
     auto thr_g2s_a = g2s_A.get_slice(threadIdx.x);
     Tensor tAgA = thr_g2s_a.partition_S(gA);   // (CPY, CPY_M, CPY_K, k)
-    Tensor tAsA = thr_g2s_a.partition_D(sA);   // (CPY, CPY_M, CPY_K) — swizzle-aware
+    Tensor tAsA = thr_g2s_a.partition_D(sA);   // (CPY, CPY_M, CPY_K)
 
     auto thr_g2s_b = g2s_B.get_slice(threadIdx.x);
     Tensor tBgB = thr_g2s_b.partition_S(gB);
@@ -63,7 +63,7 @@ void sgemm_tiling_device(
     Tensor tCrC = thr_mma.make_fragment_C(tCgC);               // (MMA, MMA_M, MMA_N)
     clear(tCrC);
 
-    // --- smem→register via make_tiled_copy_A/B (swizzle-aware partition_S) ---
+    // --- smem→register via make_tiled_copy_A/B ---
     auto s2r_thr_a = s2r_A.get_slice(threadIdx.x);
     Tensor tXsA = s2r_thr_a.partition_S(sA);                   // (CPY, MMA_M, MMA_K)
     Tensor tXrA = s2r_thr_a.retile_D(tCrA);                    // (CPY, MMA_M, MMA_K)
@@ -112,9 +112,11 @@ void sgemm_tiling_device(
 }
 
 // Host launcher
-// MC: false = K-contiguous As (LayoutRight), true = M-contiguous As (LayoutLeft)
-template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8, bool MC = false>
-void sgemm_tiling(
+template <int BM = 128, int BN = 128, int BK = 16,
+    int WM = 64, int WN = 64,
+    int WMITER = 1, int WNITER = 4,
+    int TM = 8, int TN = 4>
+void sgemm_warptiling_vectorize(
     int m, int n, int k,
     float alpha,
     const float* A, int ldA,
@@ -124,7 +126,9 @@ void sgemm_tiling(
 {
     using namespace cute;
 
-    static_assert(BM % TM == 0 && BN % TN == 0, "BM/BN must be divisible by TM/TN");
+    static_assert(BM % WM == 0 && BN % WN == 0, "BM/BN must be divisible by WM/WN");
+    static_assert(WM % (WMITER * TM) == 0 && WN % (WNITER * TN) == 0);
+    static_assert(BK % 4 == 0, "BK must be divisible by 4 for 128-bit vectorization");
 
     auto cta_tiler = make_shape(Int<BM>{}, Int<BN>{}, Int<BK>{});
     auto shape_MNK = make_shape(m, n, k);
@@ -133,44 +137,45 @@ void sgemm_tiling(
     auto dB = make_stride(ldB, Int<1>{});
     auto dC = make_stride(Int<1>{}, ldC);
 
-    constexpr int Tm = BM / TM;
-    constexpr int Tn = BN / TN;
+    constexpr int NWM = BM / WM;
+    constexpr int NWN = BN / WN;
+    constexpr int WSUBM = WM / WMITER;
+    constexpr int WSUBN = WN / WNITER;
+    constexpr int NTM = WSUBM / TM;
+    constexpr int NTN = WSUBN / TN;
+    static_assert(NTM * NTN == 32, "warp size must be 32");
+    constexpr int NUM_THREADS = NWM * NWN * 32;
+    constexpr int VEC = 4;
+    constexpr int BK_VEC = BK / VEC;
 
-    // --- Swizzled smem layouts via tile_to_shape ---
-    constexpr int atom_M = (Tm >= BK) ? Tm : BK;
-    constexpr int SWZ_B = __builtin_ctz(BK);
-    constexpr int SWZ_S = __builtin_ctz(atom_M);
-
-    // MC: LayoutLeft (M fast), KC: LayoutRight (K fast)
-    auto sA_layout = [] {
-        if constexpr (MC) {
-            auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_S>{},
-                make_layout(make_shape(Int<atom_M>{}, Int<BK>{})));
-            return tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
-        } else {
-            auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_S>{},
-                make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
-            return tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
-        }
-    }();
-
+    // --- smem layouts: plain (no swizzle) for vectorized stores ---
+    auto sA_layout = make_layout(make_shape(Int<BM>{}, Int<BK>{}), LayoutRight{});
     auto sB_layout = make_layout(make_shape(Int<BN>{}, Int<BK>{}), LayoutRight{});
     auto sC_layout = make_layout(make_shape(Int<BM>{}, Int<BN>{}));
 
-    // --- gmem→smem tiled_copy ---
-    using G2SCopyAtom = Copy_Atom<UniversalCopy<float>, float>;
-    auto g2s_copy_A = make_tiled_copy(G2SCopyAtom{},
-        make_layout(make_shape(Int<Tm>{}, Int<Tn>{}), LayoutRight{}),
-        make_layout(make_shape(Int<1>{}, Int<1>{})));
-    auto g2s_copy_B = make_tiled_copy(G2SCopyAtom{},
-        make_layout(make_shape(Int<Tm>{}, Int<Tn>{}), LayoutRight{}),
-        make_layout(make_shape(Int<1>{}, Int<1>{})));
+    // --- gmem→smem: vectorized 128-bit copies ---
+    constexpr int ThrK_A = BK_VEC;
+    constexpr int ThrM_A = NUM_THREADS / ThrK_A;
+    using G2SCopyAtomA = Copy_Atom<UniversalCopy<uint128_t>, float>;
+    auto g2s_copy_A = make_tiled_copy(G2SCopyAtomA{},
+        make_layout(make_shape(Int<ThrM_A>{}, Int<ThrK_A>{}), LayoutRight{}),
+        make_layout(make_shape(Int<1>{}, Int<VEC>{})));
 
-    // --- tiled_mma: scalar FMA tiled across (Tm, Tn) threads ---
+    constexpr int ThrK_B = BK_VEC;
+    constexpr int ThrN_B = NUM_THREADS / ThrK_B;
+    using G2SCopyAtomB = Copy_Atom<UniversalCopy<uint128_t>, float>;
+    auto g2s_copy_B = make_tiled_copy(G2SCopyAtomB{},
+        make_layout(make_shape(Int<ThrN_B>{}, Int<ThrK_B>{}), LayoutRight{}),
+        make_layout(make_shape(Int<1>{}, Int<VEC>{})));
+
+    // --- tiled_mma: warp-structured thread layout ---
     auto mma = make_tiled_mma(UniversalFMA<float, float, float, float>{},
-                              Layout<Shape<Int<Tm>, Int<Tn>, _1>>{});
+        make_layout(
+            make_shape(make_shape(Int<NTM>{}, Int<NWM>{}), make_shape(Int<NTN>{}, Int<NWN>{})),
+            make_stride(make_stride(Int<1>{}, Int<NTM * NTN>{}), make_stride(Int<NTM>{}, Int<NWM * NTM * NTN>{}))
+        ));
 
-    // --- smem→register copies aligned with MMA ---
+    // --- smem→register: scalar ---
     using S2RCopyAtom = Copy_Atom<UniversalCopy<float>, float>;
     auto s2r_copy_A = make_tiled_copy_A(S2RCopyAtom{}, mma);
     auto s2r_copy_B = make_tiled_copy_B(S2RCopyAtom{}, mma);
@@ -179,7 +184,7 @@ void sgemm_tiling(
     dim3 grid_size(size(ceil_div(m, Int<BM>{})),
                    size(ceil_div(n, Int<BN>{})));
 
-    sgemm_tiling_device<<<grid_size, block_size>>>(
+    sgemm_warptiling_vectorize_device<<<grid_size, block_size>>>(
         shape_MNK, cta_tiler, alpha,
         A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
         B, dB, g2s_copy_B, s2r_copy_B, sB_layout,

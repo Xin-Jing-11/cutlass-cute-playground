@@ -21,7 +21,7 @@ import cutlass.cute as cute
 from cutlass.cute import nvgpu
 
 
-class SgemmVectorize:
+class SgemmTilingVectorize:
     """
     Vectorize SGEMM: 128-bit gmem→smem copies, no swizzle.
     (BM/TM) x (BN/TN) threads per CTA.
