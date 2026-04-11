@@ -12,7 +12,7 @@ SGEMM (and FlashAttention) kernels written three ways on an RTX 5080, benchmarke
 
 ![SGEMM benchmark at M=N=K=4096](bench_results/bench_sgemm_4096.png)
 
-Best kernels reach **~83% of cuBLAS** (25.9 / 31.3 TFLOPS). Highlights:
+Highlights:
 
 - **`warptiling` wins** — hierarchical warp→subtile→thread tiling is the main step up from register tiling.
 - **`warptiling_vec` is slower than `warptiling`** — vectorized 128-bit g2s copies force disabling the smem swizzle, and the resulting bank conflicts outweigh the bandwidth gain.

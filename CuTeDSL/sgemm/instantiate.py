@@ -28,7 +28,7 @@ VARIANTS = {
     "tiling_mc_64x64x8x8x8":        (SgemmTiling, dict(bm=64, bn=64, bk=8, tm=8, tn=8, mc=True)),
     "tiling_mc_128x128x16x8x8":     (SgemmTiling, dict(bm=128, bn=128, bk=16, tm=8, tn=8, mc=True)),
 
-    # tiling_vectorize (128-bit g2s, no swizzle, no MC — see sgemm_tiling_vectorize.py)
-    "tiling_vectorize_64x64x16x8x8":       (SgemmTilingVectorize, dict(bm=64, bn=64, bk=16, tm=8, tn=8)),
+    # tiling_vectorize (128-bit g2s + Swizzle<B,2,S> on sA, no MC)
+    # 64x64 config disabled: trips NVIDIA/cutlass#3160 (swizzled ComposedLayout + CPY>1 tiling)
     "tiling_vectorize_128x128x16x8x8":     (SgemmTilingVectorize, dict(bm=128, bn=128, bk=16, tm=8, tn=8)),
 }

@@ -41,10 +41,10 @@ void sgemm_tiling_vectorize_device(
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{}); // BN x BK x k
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // BM x BN
 
-    // allocate smem — plain layouts (no swizzle), cosize_v works directly
-    __shared__ __align__(128) float smemA[cosize_v<ASmemLayout>];
+    // allocate smem — cosize from the outer (plain) layout of the composition
+    __shared__ __align__(128) float smemA[cosize_v<decltype(sA_layout.layout_b())>];
     __shared__ __align__(128) float smemB[cosize_v<BSmemLayout>];
-    Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);
+    Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // swizzled ComposedLayout
     Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);
 
     // --- gmem->smem via tiled_copy ---
@@ -141,8 +141,16 @@ void sgemm_tiling_vectorize(
     constexpr int VEC = 4;
     constexpr int BK_VEC = BK / VEC;
 
-    // A smem: K-contiguous (LayoutRight, K fast), no swizzle
-    auto sA_layout = make_layout(make_shape(Int<BM>{}, Int<BK>{}), LayoutRight{});
+    // A smem: K-contiguous (LayoutRight), swizzled with M=2 to preserve
+    // 128-bit store alignment (low 2 bits of flat index are untouched).
+    constexpr int atom_M = (Tm >= BK) ? Tm : BK;
+    constexpr int SWZ_M  = 2;                                // preserve 128-bit (4-float) alignment
+    constexpr int SWZ_B  = __builtin_ctz(BK) - SWZ_M;        // bits of k above the 2 preserved
+    constexpr int SWZ_S  = __builtin_ctz(atom_M);
+    static_assert(SWZ_B > 0, "BK must be > VEC=4 for M=2 swizzle");
+    auto swizzle_atom = composition(Swizzle<SWZ_B, SWZ_M, SWZ_S>{},
+        make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
+    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
 
     // A g2s: vectorized (K contiguous in both gmem and smem)
     constexpr int ThrK_A = BK_VEC;

@@ -1,18 +1,20 @@
 """
 Vectorize SGEMM using CuTe DSL (TN): D = alpha * A^T * B + beta * C
 
-Key difference from sgemm_tiling: 128-bit (float4) vectorized gmem→smem copies.
-Swizzle is omitted because Swizzle<B,0,S> (M=0) breaks 128-bit store alignment.
+128-bit (float4) vectorized gmem→smem copies, with a `Swizzle<B, 2, S>` XOR
+swizzle on sA. The M=2 offset leaves the low 2 bits of the flat index untouched,
+preserving 4-float alignment so 128-bit stores remain valid.
 
 No MC variant: A gmem is (M,K):(K,1) so K is contiguous, but MC smem has M
-contiguous — the layout mismatch prevents vectorized stores. Use sgemm_tiling
-with mc=True instead.
+contiguous — the layout mismatch prevents vectorized stores.
 
 A stored (K,M) col-major → CuTe (M,K):(K,1).
 B stored (K,N) col-major → CuTe (N,K):(K,1).
 C stored (M,N) col-major → CuTe (M,N):(1,M).
 Float32 in/out.
 """
+
+import math
 
 import cuda.bindings.driver as cuda_driver
 
@@ -56,8 +58,16 @@ class SgemmTilingVectorize:
         VEC = 4  # 128-bit / 32-bit = 4 floats
         BK_VEC = BK // VEC
 
-        # --- smem layouts: plain (no swizzle), K-contiguous (row-major) ---
-        sA_layout = cute.make_layout((BM, BK), stride=(BK, 1))
+        # --- sA smem: Swizzle<B,2,S> to preserve 128-bit alignment ---
+        atom_M = max(BK, Tm)
+        swz_M = 2                              # preserve low 2 bits (4-float alignment)
+        swz_B = int(math.log2(BK)) - swz_M     # remaining k-bits to XOR
+        swz_S = int(math.log2(atom_M))
+        assert swz_B > 0, "BK must be > VEC=4 for M=2 swizzle"
+        swizzle_atom = cute.make_composed_layout(
+            cute.make_swizzle(swz_B, swz_M, swz_S), 0,
+            cute.make_layout((atom_M, BK), stride=(BK, 1)))
+        sA_layout = cute.tile_to_shape(swizzle_atom, (BM, BK), (0, 1))
         sB_layout = cute.make_layout((BN, BK), stride=(BK, 1))
 
         # --- gmem→smem: vectorized 128-bit copies ---
@@ -116,7 +126,7 @@ class SgemmTilingVectorize:
         tiled_mma: cute.TiledMma,
         s2r_A: cute.TiledCopy,
         s2r_B: cute.TiledCopy,
-        sA_layout: cute.Layout,
+        sA_layout: cute.ComposedLayout,
         sB_layout: cute.Layout,
     ):
         BM, BN, BK = self._bm, self._bn, self._bk

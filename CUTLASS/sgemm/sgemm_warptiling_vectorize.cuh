@@ -40,10 +40,10 @@ void sgemm_warptiling_vectorize_device(
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{}); // BN x BK x k
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // BM x BN
 
-    // allocate smem — plain layouts (no swizzle), cosize_v works directly
-    __shared__ __align__(128) float smemA[cosize_v<ASmemLayout>];
+    // allocate smem — cosize from the outer (plain) layout of the composition
+    __shared__ __align__(128) float smemA[cosize_v<decltype(sA_layout.layout_b())>];
     __shared__ __align__(128) float smemB[cosize_v<BSmemLayout>];
-    Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);
+    Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // swizzled ComposedLayout
     Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);
 
     // --- gmem→smem via tiled_copy ---
@@ -148,8 +148,16 @@ void sgemm_warptiling_vectorize(
     constexpr int VEC = 4;
     constexpr int BK_VEC = BK / VEC;
 
-    // --- smem layouts: plain (no swizzle) for vectorized stores ---
-    auto sA_layout = make_layout(make_shape(Int<BM>{}, Int<BK>{}), LayoutRight{});
+    // --- sA swizzled with M=2 to preserve 128-bit store alignment ---
+    constexpr int THR_M = NTM * NWM;
+    constexpr int atom_M = (THR_M >= BK) ? THR_M : BK;
+    constexpr int SWZ_M  = 2;
+    constexpr int SWZ_B  = __builtin_ctz(BK) - SWZ_M;
+    constexpr int SWZ_S  = __builtin_ctz(atom_M);
+    static_assert(SWZ_B > 0, "BK must be > VEC=4 for M=2 swizzle");
+    auto swizzle_atom = composition(Swizzle<SWZ_B, SWZ_M, SWZ_S>{},
+        make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
+    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
     auto sB_layout = make_layout(make_shape(Int<BN>{}, Int<BK>{}), LayoutRight{});
     auto sC_layout = make_layout(make_shape(Int<BM>{}, Int<BN>{}));
 
