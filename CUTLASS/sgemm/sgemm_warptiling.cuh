@@ -111,7 +111,8 @@ void sgemm_warptiling_device(
 }
 
 // Host launcher
-// MC: false = K-contiguous As (LayoutRight), true = M-contiguous As (LayoutLeft)
+// MC=false (default): K-contiguous As (LayoutRight) + read-side swizzle
+// MC=true:            M-contiguous As (LayoutLeft)  + write-side swizzle
 template <int BM = 128, int BN = 128, int BK = 16,
     int WM = 64, int WN = 64,
     int WMITER = 1, int WNITER = 4,
@@ -151,19 +152,22 @@ void sgemm_warptiling(
     constexpr int SWZ_B = __builtin_ctz(BK);
     constexpr int SWZ_S = __builtin_ctz(atom_M);
 
-    // MC: LayoutLeft (M fast), KC: LayoutRight (K fast)
-    auto sA_layout = [] {
-        if constexpr (MC) {
-            auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_S>{},
-                make_layout(make_shape(Int<atom_M>{}, Int<BK>{})));
-            return tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
-        } else {
-            auto swizzle_atom = composition(Swizzle<SWZ_B, 0, SWZ_S>{},
-                make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
-            return tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
-        }
+    // MC=true: LayoutLeft (M contiguous) + write-side swizzle
+    // MC=false: LayoutRight (K contiguous) + read-side swizzle
+    auto sA_layout = [&]() {
+        if constexpr (MC)
+            return tile_to_shape(
+                composition(Swizzle<SWZ_B, 0, SWZ_S>{},
+                    make_layout(make_shape(Int<atom_M>{}, Int<BK>{}))),
+                make_shape(Int<BM>{}, Int<BK>{}));
+        else
+            return tile_to_shape(
+                composition(Swizzle<SWZ_B, 0, SWZ_S>{},
+                    make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{})),
+                make_shape(Int<BM>{}, Int<BK>{}));
     }();
-    
+
+
     auto sB_layout = make_layout(make_shape(Int<BN>{}, Int<BK>{}), LayoutRight{});
     auto sC_layout = make_layout(make_shape(Int<BM>{}, Int<BN>{}));
 

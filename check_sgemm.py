@@ -216,7 +216,7 @@ def print_result(name, passed, abs_err, rel_err, err):
         print(f"{name:<20} ERROR   {err}")
         return
     status = "PASS" if passed else "FAIL"
-    print(f"{name:<55} {status:<6} abs_err={abs_err:.3e} rel_err={rel_err:.3e}")
+    print(f"{name:<60} {status:<6} abs_err={abs_err:.3e} rel_err={rel_err:.3e}")
 
 
 def main():

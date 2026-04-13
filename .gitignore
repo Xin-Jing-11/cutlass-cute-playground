@@ -27,3 +27,6 @@ bench_hgemm.py
 
 # ncu
 ncu_report/
+
+# notes
+experience/

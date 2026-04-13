@@ -2,17 +2,19 @@
 #include <cute/tensor.hpp>
 #include <cute/atom/copy_atom.hpp>
 #include <cute/atom/mma_atom.hpp>
+#include <cute/arch/copy_sm80.hpp>
 
 /*
- * Warptiling Vectorize SGEMM using CuTe: D = alpha * A^T * B + beta * C   (TN layout)
+ * Double-buffered SGEMM using CuTe: D = alpha * A^T * B + beta * C   (TN layout)
  * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  *
- * Combines warptiling thread layout with 128-bit vectorized gmem→smem copies.
+ * Uses cp.async for gmem→smem with double-buffered smem to overlap
+ * data movement with computation.
  *
- * MC=false (default): KC smem, SWZ_M=2 swizzle preserves 128-bit store alignment,
- *   single float4 store per cp, residual 2-way read bank conflicts.
- * MC=true: MC smem, full Swizzle<ctz(BK),0,SWZ_S>, scalar stores for A (scatter),
- *   conflict-free reads. B copy remains vectorized.
+ * Pipeline schedule:
+ *   prologue : issue tile 0 → fence → wait → sync
+ *   mainloop : issue tile (i+1) → fence → compute tile i → wait → sync
+ *   epilogue : compute final tile, write C
  */
 
 template <class ProblemShape, class CtaTiler,
@@ -21,7 +23,7 @@ template <class ProblemShape, class CtaTiler,
     class CStride, class TiledMMA, class CSmemLayout>
 __global__ static
 __launch_bounds__(decltype(size(TiledMMA{}))::value)
-void sgemm_warptiling_vectorize_device(
+void sgemm_double_buffering_device(
     ProblemShape shape_MNK, CtaTiler cta_tiler,
     float alpha,
     const float* A, AStride dA, TiledCopyA g2s_A, S2RCopyA s2r_A, ASmemLayout sA_layout,
@@ -41,85 +43,110 @@ void sgemm_warptiling_vectorize_device(
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{}); // BN x BK x k
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // BM x BN
 
-    // allocate smem — cosize from the outer (plain) layout of the composition
-    __shared__ __align__(128) float smemA[cosize_v<decltype(sA_layout.layout_b())>];
-    __shared__ __align__(128) float smemB[cosize_v<BSmemLayout>];
-    Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // swizzled ComposedLayout
-    Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);
+    // Double-buffered smem
+    constexpr int smemA_elem = cosize_v<decltype(sA_layout.layout_b())>;
+    constexpr int smemB_elem = cosize_v<BSmemLayout>;
+    __shared__ __align__(128) float smemA[2 * smemA_elem];
+    __shared__ __align__(128) float smemB[2 * smemB_elem];
 
-    // --- gmem→smem via tiled_copy ---
+    // --- gmem→smem partitions ---
     auto thr_g2s_a = g2s_A.get_slice(threadIdx.x);
     Tensor tAgA = thr_g2s_a.partition_S(gA);   // (CPY, CPY_M, CPY_K, k)
-    Tensor tAsA = thr_g2s_a.partition_D(sA);   // (CPY, CPY_M, CPY_K)
 
     auto thr_g2s_b = g2s_B.get_slice(threadIdx.x);
     Tensor tBgB = thr_g2s_b.partition_S(gB);
-    Tensor tBsB = thr_g2s_b.partition_D(sB);
 
-    // --- MMA partitions ---
+    // --- MMA partitions (use buffer 0 as reference for fragment shapes) ---
+    Tensor sA_ref = make_tensor(make_smem_ptr(smemA), sA_layout);
+    Tensor sB_ref = make_tensor(make_smem_ptr(smemB), sB_layout);
+
     auto thr_mma = mma.get_slice(threadIdx.x);
     Tensor tCgC = thr_mma.partition_C(gC);                     // (MMA, MMA_M, MMA_N)
-    Tensor tCrA = thr_mma.partition_fragment_A(sA);            // (MMA, MMA_M, MMA_K)
-    Tensor tCrB = thr_mma.partition_fragment_B(sB);            // (MMA, MMA_N, MMA_K)
+    Tensor tCrA = thr_mma.partition_fragment_A(sA_ref);        // (MMA, MMA_M, MMA_K)
+    Tensor tCrB = thr_mma.partition_fragment_B(sB_ref);        // (MMA, MMA_N, MMA_K)
     Tensor tCrC = thr_mma.make_fragment_C(tCgC);               // (MMA, MMA_M, MMA_N)
     clear(tCrC);
 
-    // --- smem→register via make_tiled_copy_A/B ---
+    // --- smem→register retile ---
     auto s2r_thr_a = s2r_A.get_slice(threadIdx.x);
-    Tensor tXsA = s2r_thr_a.partition_S(sA);                   // (CPY, MMA_M, MMA_K)
     Tensor tXrA = s2r_thr_a.retile_D(tCrA);                    // (CPY, MMA_M, MMA_K)
 
     auto s2r_thr_b = s2r_B.get_slice(threadIdx.x);
-    Tensor tXsB = s2r_thr_b.partition_S(sB);                   // (CPY, MMA_N, MMA_K)
     Tensor tXrB = s2r_thr_b.retile_D(tCrB);                    // (CPY, MMA_N, MMA_K)
 
-#ifdef DEBUG
-    if (thread0()) {
-        print("  sA   : "); print(  sA.layout()); print("\n");
-        print("  sB   : "); print(  sB.layout()); print("\n");
-        print("tAgA   : "); print(tAgA.layout()); print("\n");
-        print("tAsA   : "); print(tAsA.layout()); print("\n");
-        print("tCgC   : "); print(tCgC.layout()); print("\n");
-        print("tCrA   : "); print(tCrA.layout()); print("\n");
-        print("tCrB   : "); print(tCrB.layout()); print("\n");
-        print("tCrC   : "); print(tCrC.layout()); print("\n");
-        print("tXsA   : "); print(tXsA.layout()); print("\n");
-        print("tXrA   : "); print(tXrA.layout()); print("\n");
-        print("tXsB   : "); print(tXsB.layout()); print("\n");
-        print("tXrB   : "); print(tXrB.layout()); print("\n");
-    }
-#endif
-
-    auto K_TILE_MAX = size<3>(tAgA);
+    auto K_TILE_MAX  = size<3>(tAgA);
     auto K_BLOCK_MAX = size<2>(tCrA);
 
-    CUTE_NO_UNROLL
-    for (int k_tile = 0; k_tile < K_TILE_MAX; k_tile += 1) {
-        // gmem → smem
-        copy(g2s_A, tAgA(_, _, _, k_tile), tAsA);
-        copy(g2s_B, tBgB(_, _, _, k_tile), tBsB);
+    int buf_read = 0, buf_write = 1;
+
+    // ========== Prologue: load tile 0 into buffer 0 ==========
+    {
+        Tensor sA_w = make_tensor(make_smem_ptr(smemA), sA_layout);
+        Tensor sB_w = make_tensor(make_smem_ptr(smemB), sB_layout);
+        copy(g2s_A, tAgA(_, _, _, 0), thr_g2s_a.partition_D(sA_w));
+        copy(g2s_B, tBgB(_, _, _, 0), thr_g2s_b.partition_D(sB_w));
+        cp_async_fence();
+        cp_async_wait<0>();
         __syncthreads();
-        // inner K-loop: smem→register, then gemm
+    }
+
+    // ========== Mainloop: all but final tile ==========
+    CUTE_NO_UNROLL
+    for (int k_tile = 1; k_tile < K_TILE_MAX; ++k_tile) {
+        // Issue async copies for next tile into write buffer
+        {
+            Tensor sA_w = make_tensor(make_smem_ptr(smemA + buf_write * smemA_elem), sA_layout);
+            Tensor sB_w = make_tensor(make_smem_ptr(smemB + buf_write * smemB_elem), sB_layout);
+            copy(g2s_A, tAgA(_, _, _, k_tile), thr_g2s_a.partition_D(sA_w));
+            copy(g2s_B, tBgB(_, _, _, k_tile), thr_g2s_b.partition_D(sB_w));
+            cp_async_fence();
+        }
+
+        // Compute on read buffer (overlaps with async copies)
+        {
+            Tensor sA_r = make_tensor(make_smem_ptr(smemA + buf_read * smemA_elem), sA_layout);
+            Tensor sB_r = make_tensor(make_smem_ptr(smemB + buf_read * smemB_elem), sB_layout);
+            Tensor tXsA = s2r_thr_a.partition_S(sA_r);
+            Tensor tXsB = s2r_thr_b.partition_S(sB_r);
+            CUTE_UNROLL
+            for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
+                copy(s2r_A, tXsA(_, _, k_block), tXrA(_, _, k_block));
+                copy(s2r_B, tXsB(_, _, k_block), tXrB(_, _, k_block));
+                gemm(mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
+            }
+        }
+
+        // Wait for async copies to complete
+        cp_async_wait<0>();
+        __syncthreads();
+
+        buf_read ^= 1;
+        buf_write ^= 1;
+    }
+
+    // ========== Epilogue: compute on final tile ==========
+    {
+        Tensor sA_r = make_tensor(make_smem_ptr(smemA + buf_read * smemA_elem), sA_layout);
+        Tensor sB_r = make_tensor(make_smem_ptr(smemB + buf_read * smemB_elem), sB_layout);
+        Tensor tXsA = s2r_thr_a.partition_S(sA_r);
+        Tensor tXsB = s2r_thr_b.partition_S(sB_r);
         CUTE_UNROLL
         for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
             copy(s2r_A, tXsA(_, _, k_block), tXrA(_, _, k_block));
             copy(s2r_B, tXsB(_, _, k_block), tXrB(_, _, k_block));
             gemm(mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
         }
-        __syncthreads();
     }
 
     axpby(alpha, tCrC, beta, tCgC);
 }
 
 // Host launcher
-// MC=false (default): KC smem + vectorized A copy (128-bit, SWZ_M=2)
-// MC=true:            MC smem + scalar A copy (scatter stores, full swizzle)
 template <int BM = 128, int BN = 128, int BK = 16,
     int WM = 64, int WN = 64,
     int WMITER = 1, int WNITER = 4,
-    int TM = 8, int TN = 4, bool MC = false>
-void sgemm_warptiling_vectorize(
+    int TM = 8, int TN = 4>
+void sgemm_double_buffering(
     int m, int n, int k,
     float alpha,
     const float* A, int ldA,
@@ -151,50 +178,30 @@ void sgemm_warptiling_vectorize(
     constexpr int VEC = 4;
     constexpr int BK_VEC = BK / VEC;
 
+    // --- sA swizzled with M=2 to preserve 128-bit store alignment ---
     constexpr int THR_M = NTM * NWM;
-    constexpr int atom_M  = (THR_M >= BK) ? THR_M : BK;
-    constexpr int SWZ_S   = __builtin_ctz(atom_M);
-    constexpr int SWZ_B_full = __builtin_ctz(BK);       // for MC: full swizzle
-    constexpr int SWZ_M_vec  = 2;                        // for KC: preserve 128-bit alignment
-    constexpr int SWZ_B_vec  = SWZ_B_full - SWZ_M_vec;  // for KC
-    static_assert(MC || SWZ_B_vec > 0, "BK must be > VEC=4 for KC M=2 swizzle");
-
-    // sA: MC=true → LayoutLeft + full swizzle; MC=false → LayoutRight + SWZ_M=2
-    auto sA_layout = [&]() {
-        if constexpr (MC)
-            return tile_to_shape(
-                composition(Swizzle<SWZ_B_full, 0, SWZ_S>{},
-                    make_layout(make_shape(Int<atom_M>{}, Int<BK>{}))),
-                make_shape(Int<BM>{}, Int<BK>{}));
-        else
-            return tile_to_shape(
-                composition(Swizzle<SWZ_B_vec, SWZ_M_vec, SWZ_S>{},
-                    make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{})),
-                make_shape(Int<BM>{}, Int<BK>{}));
-    }();
+    constexpr int atom_M = (THR_M >= BK) ? THR_M : BK;
+    constexpr int SWZ_M  = 2;
+    constexpr int SWZ_B  = __builtin_ctz(BK) - SWZ_M;
+    constexpr int SWZ_S  = __builtin_ctz(atom_M);
+    static_assert(SWZ_B > 0, "BK must be > VEC=4 for M=2 swizzle");
+    auto swizzle_atom = composition(Swizzle<SWZ_B, SWZ_M, SWZ_S>{},
+        make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
+    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
     auto sB_layout = make_layout(make_shape(Int<BN>{}, Int<BK>{}), LayoutRight{});
     auto sC_layout = make_layout(make_shape(Int<BM>{}, Int<BN>{}));
 
-    // A g2s: MC → scalar copy (scatter to MC layout); KC → vectorized 128-bit
-    constexpr int ThrK_A = MC ? BK : BK_VEC;
+    // --- gmem→smem: async 128-bit copies via cp.async ---
+    constexpr int ThrK_A = BK_VEC;
     constexpr int ThrM_A = NUM_THREADS / ThrK_A;
-    auto g2s_copy_A = [&]() {
-        if constexpr (MC) {
-            using G2SCopyAtomA = Copy_Atom<UniversalCopy<float>, float>;
-            return make_tiled_copy(G2SCopyAtomA{},
-                make_layout(make_shape(Int<ThrM_A>{}, Int<ThrK_A>{}), LayoutRight{}),
-                make_layout(make_shape(Int<1>{}, Int<1>{})));
-        } else {
-            using G2SCopyAtomA = Copy_Atom<UniversalCopy<uint128_t>, float>;
-            return make_tiled_copy(G2SCopyAtomA{},
-                make_layout(make_shape(Int<ThrM_A>{}, Int<ThrK_A>{}), LayoutRight{}),
-                make_layout(make_shape(Int<1>{}, Int<VEC>{})));
-        }
-    }();
+    using G2SCopyAtomA = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, float>;
+    auto g2s_copy_A = make_tiled_copy(G2SCopyAtomA{},
+        make_layout(make_shape(Int<ThrM_A>{}, Int<ThrK_A>{}), LayoutRight{}),
+        make_layout(make_shape(Int<1>{}, Int<VEC>{})));
 
     constexpr int ThrK_B = BK_VEC;
     constexpr int ThrN_B = NUM_THREADS / ThrK_B;
-    using G2SCopyAtomB = Copy_Atom<UniversalCopy<uint128_t>, float>;
+    using G2SCopyAtomB = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, float>;
     auto g2s_copy_B = make_tiled_copy(G2SCopyAtomB{},
         make_layout(make_shape(Int<ThrN_B>{}, Int<ThrK_B>{}), LayoutRight{}),
         make_layout(make_shape(Int<1>{}, Int<VEC>{})));
@@ -215,7 +222,7 @@ void sgemm_warptiling_vectorize(
     dim3 grid_size(size(ceil_div(m, Int<BM>{})),
                    size(ceil_div(n, Int<BN>{})));
 
-    sgemm_warptiling_vectorize_device<<<grid_size, block_size>>>(
+    sgemm_double_buffering_device<<<grid_size, block_size>>>(
         shape_MNK, cta_tiler, alpha,
         A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
         B, dB, g2s_copy_B, s2r_copy_B, sB_layout,

@@ -45,24 +45,22 @@ def parse_bench_output(text):
 
 
 def canonical(kernel):
-    """Return (family_label, is_mc)."""
-    is_mc = "_mc_" in kernel or kernel.endswith("_mc")
-    k = kernel.replace("_mc_", "_")
-    if k.endswith("_mc"):
-        k = k[:-3]
-    if k.startswith("naive"):
-        return "naive", is_mc
-    if k.startswith("smem"):
-        return "smem", is_mc
-    if k.startswith("tiling_vectorize_"):
-        return f"tiling_vec {k.replace('tiling_vectorize_', '')}", is_mc
-    if k.startswith("tiling_"):
-        return f"tiling {k.replace('tiling_', '')}", is_mc
-    if k.startswith("warptiling_vectorize_"):
-        return f"warptiling_vec {k.replace('warptiling_vectorize_', '')}", is_mc
-    if k.startswith("warptiling_"):
-        return f"warptiling {k.replace('warptiling_', '')}", is_mc
-    return k, is_mc
+    """Return family_label for grouping."""
+    if kernel.startswith("naive"):
+        return "naive"
+    if kernel.startswith("smem"):
+        return "smem"
+    if kernel.startswith("tiling_vectorize_"):
+        return f"tiling_vec {kernel.replace('tiling_vectorize_', '')}"
+    if kernel.startswith("tiling_"):
+        return f"tiling {kernel.replace('tiling_', '')}"
+    if kernel.startswith("warptiling_vectorize_"):
+        return f"warptiling_vec {kernel.replace('warptiling_vectorize_', '')}"
+    if kernel.startswith("warptiling_"):
+        return f"warptiling {kernel.replace('warptiling_', '')}"
+    if kernel.startswith("double_buffering_"):
+        return f"double_buffering {kernel.replace('double_buffering_', '')}"
+    return kernel
 
 
 def family_display_name(fam):
@@ -80,8 +78,8 @@ def family_display_name(fam):
             return f"{prefix.replace('_vec', '+vec')}  {bm}×{bn}×{bk} / {tm}×{tn}"
         except ValueError:
             return fam
-    # warptiling kernels: BMxBNxBKxWMxWNxWMITERxWNITERxTMxTN
-    if prefix in ("warptiling", "warptiling_vec"):
+    # warptiling / double_buffering kernels: BMxBNxBKxWMxWNxWMITERxWNITERxTMxTN
+    if prefix in ("warptiling", "warptiling_vec", "double_buffering"):
         try:
             bm, bn, bk, wm, wn, wmi, wni, tm, tn = sizes.split("x")
             return (f"{prefix.replace('_vec', '+vec')}  "
@@ -95,8 +93,8 @@ def build_plot(entries, cublas_gflops, size, out_path):
     # Group by family
     data = defaultdict(list)
     for backend, kernel, gflops in entries:
-        fam, is_mc = canonical(kernel)
-        data[fam].append((backend, is_mc, gflops))
+        fam = canonical(kernel)
+        data[fam].append((backend, gflops))
 
     # Order families from simplest to most optimized
     preferred_order = [
@@ -108,6 +106,7 @@ def build_plot(entries, cublas_gflops, size, out_path):
         "tiling_vec 128x128x16x8x8",
         "warptiling 128x128x16x64x64x1x4x8x4",
         "warptiling_vec 128x128x16x64x64x1x4x8x4",
+        "double_buffering 128x128x8x64x64x2x2x8x4",
     ]
     family_order = [f for f in preferred_order if f in data]
     # Append any unrecognized families at the end
@@ -127,22 +126,22 @@ def build_plot(entries, cublas_gflops, size, out_path):
         "cutedsl": "CuTeDSL (Python)",
     }
 
-    # Build row list (sorted within family by backend then KC-before-MC)
+    # Build row list (sorted within family by backend)
     rows = []
     for fam in family_order:
         fam_entries = sorted(
             data[fam],
-            key=lambda x: (backends.index(x[0]) if x[0] in backends else 99, x[1]),
+            key=lambda x: backends.index(x[0]) if x[0] in backends else 99,
         )
-        for be, is_mc, g in fam_entries:
-            rows.append((fam, be, is_mc, g))
+        for be, g in fam_entries:
+            rows.append((fam, be, g))
 
     fig, ax = plt.subplots(figsize=(15, max(7, 1.0 + 0.35 * len(rows))))
     bar_h = 0.75
     family_gap = 0.9
 
     # Compute x-axis extent
-    max_val = max((g for _, _, _, g in rows), default=1)
+    max_val = max((g for _, _, g in rows), default=1)
     x_max = max(cublas_gflops or 0, max_val) * 1.15
     x_label_offset = x_max * 0.015
     label_x = -x_max * 0.05
@@ -152,7 +151,7 @@ def build_plot(entries, cublas_gflops, size, out_path):
     current_family = None
     family_first_y = {}
 
-    for fam, be, is_mc, g in rows:
+    for fam, be, g in rows:
         if fam != current_family:
             if current_family is not None:
                 y += family_gap
@@ -160,19 +159,18 @@ def build_plot(entries, cublas_gflops, size, out_path):
             family_first_y[fam] = y
 
         color = backend_colors.get(be, "#888888")
-        hatch = "///" if is_mc else ""
-        ax.barh(y, g, height=bar_h, color=color, hatch=hatch,
+        ax.barh(y, g, height=bar_h, color=color,
                 edgecolor="white", linewidth=0.6, zorder=3)
         ax.text(g + x_label_offset, y, f"{g:,}", va="center",
                 fontsize=9, color="#222", zorder=4)
-        tag = backend_display.get(be, be) + ("  (MC)" if is_mc else "")
+        tag = backend_display.get(be, be)
         ax.text(label_x, y, tag, va="center", ha="right",
                 fontsize=9, color=color, fontweight="bold")
         y += 1.0
 
     # Family labels on the left
     family_row_counts = defaultdict(int)
-    for fam, _, _, _ in rows:
+    for fam, _, _ in rows:
         family_row_counts[fam] += 1
     for fam, first_y in family_first_y.items():
         n = family_row_counts[fam]
@@ -210,15 +208,11 @@ def build_plot(entries, cublas_gflops, size, out_path):
     # Legend
     backend_patches = [
         mpatches.Patch(color=backend_colors[b], label=backend_display[b])
-        for b in backends if b in {be for _, be, _, _ in rows}
+        for b in backends if b in {be for _, be, _ in rows}
     ]
-    kc_patch = mpatches.Patch(facecolor="lightgray", edgecolor="white",
-                              label="KC layout (default)")
-    mc_patch = mpatches.Patch(facecolor="lightgray", hatch="///",
-                              edgecolor="white", label="MC layout")
-    ax.legend(handles=backend_patches + [kc_patch, mc_patch],
+    ax.legend(handles=backend_patches,
               loc="lower right", fontsize=10, framealpha=0.95,
-              title="Backend / Layout", title_fontsize=10)
+              title="Backend", title_fontsize=10)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")

@@ -14,8 +14,8 @@ inline bool is_pow2(int x) {
 //   M = bit position of the destination (base) bits
 //   S = shift distance from destination to source bits (S >= 0)
 template <int B, int M, int S>
-__host__ __device__
-inline int swizzle(int offset) {
+__host__ __device__ __forceinline__ constexpr
+int swizzle(int offset) {
     static_assert(B >= 0 && M >= 0 && S >= 0, "B, M, S must be non-negative");
     constexpr int bit_msk = (1 << B) - 1;
     constexpr int zzz_msk = bit_msk << (M + S);

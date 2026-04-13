@@ -8,11 +8,11 @@
  * A(M,K):(K,1), B(K,N):(1,K), C(M,N):(1,M).
  *
  * Key difference from sgemm_tiling: 128-bit (float4) vectorized gmem→smem copies.
- * Swizzle is omitted because Swizzle<B,0,S> (M=0) breaks 128-bit store alignment.
  *
- * No MC variant: A gmem is (M,K):(K,1) so K is contiguous, but MC smem has M
- * contiguous — the layout mismatch prevents vectorized stores. Use sgemm_tiling
- * with MC=true instead.
+ * MC=false (default): KC smem, SWZ_M=2 swizzle preserves 128-bit store alignment,
+ *   single float4 store per cp, residual 2-way read bank conflicts.
+ * MC=true: MC smem, full Swizzle<ctz(BK),0,SWZ_S>, scalar stores for A (scatter),
+ *   conflict-free reads. B copy remains vectorized.
  */
 
 template <class ProblemShape, class CtaTiler,
@@ -115,7 +115,9 @@ void sgemm_tiling_vectorize_device(
 }
 
 // Host launcher
-template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8>
+// MC=false (default): KC smem + vectorized A copy (128-bit, SWZ_M=2)
+// MC=true:            MC smem + scalar A copy (scatter stores, full swizzle)
+template <int BM = 128, int BN = 128, int BK = 16, int TM = 8, int TN = 8, bool MC = false>
 void sgemm_tiling_vectorize(
     int m, int n, int k,
     float alpha,
@@ -141,24 +143,44 @@ void sgemm_tiling_vectorize(
     constexpr int VEC = 4;
     constexpr int BK_VEC = BK / VEC;
 
-    // A smem: K-contiguous (LayoutRight), swizzled with M=2 to preserve
-    // 128-bit store alignment (low 2 bits of flat index are untouched).
-    constexpr int atom_M = (Tm >= BK) ? Tm : BK;
-    constexpr int SWZ_M  = 2;                                // preserve 128-bit (4-float) alignment
-    constexpr int SWZ_B  = __builtin_ctz(BK) - SWZ_M;        // bits of k above the 2 preserved
-    constexpr int SWZ_S  = __builtin_ctz(atom_M);
-    static_assert(SWZ_B > 0, "BK must be > VEC=4 for M=2 swizzle");
-    auto swizzle_atom = composition(Swizzle<SWZ_B, SWZ_M, SWZ_S>{},
-        make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{}));
-    auto sA_layout = tile_to_shape(swizzle_atom, make_shape(Int<BM>{}, Int<BK>{}));
+    constexpr int atom_M  = (Tm >= BK) ? Tm : BK;
+    constexpr int SWZ_S   = __builtin_ctz(atom_M);
+    constexpr int SWZ_B_full = __builtin_ctz(BK);       // for MC: full swizzle
+    constexpr int SWZ_M_vec  = 2;                        // for KC: preserve 128-bit alignment
+    constexpr int SWZ_B_vec  = SWZ_B_full - SWZ_M_vec;  // for KC: bits above preserved region
+    static_assert(MC || SWZ_B_vec > 0, "BK must be > VEC=4 for KC M=2 swizzle");
 
-    // A g2s: vectorized (K contiguous in both gmem and smem)
-    constexpr int ThrK_A = BK_VEC;
-    constexpr int ThrM_A = Tm * Tn / ThrK_A;
-    using G2SCopyAtomA = Copy_Atom<UniversalCopy<uint128_t>, float>;
-    auto g2s_copy_A = make_tiled_copy(G2SCopyAtomA{},
-        make_layout(make_shape(Int<ThrM_A>{}, Int<ThrK_A>{}), LayoutRight{}),
-        make_layout(make_shape(Int<1>{}, Int<VEC>{})));
+    // sA: MC=true → LayoutLeft + full swizzle (conflict-free reads, scatter stores)
+    //     MC=false → LayoutRight + SWZ_M=2 swizzle (vectorized stores, partial read conflicts)
+    auto sA_layout = [&]() {
+        if constexpr (MC)
+            return tile_to_shape(
+                composition(Swizzle<SWZ_B_full, 0, SWZ_S>{},
+                    make_layout(make_shape(Int<atom_M>{}, Int<BK>{}))),
+                make_shape(Int<BM>{}, Int<BK>{}));
+        else
+            return tile_to_shape(
+                composition(Swizzle<SWZ_B_vec, SWZ_M_vec, SWZ_S>{},
+                    make_layout(make_shape(Int<atom_M>{}, Int<BK>{}), LayoutRight{})),
+                make_shape(Int<BM>{}, Int<BK>{}));
+    }();
+
+    // A g2s: MC → scalar copy (scatter to MC layout); KC → vectorized 128-bit
+    constexpr int ThrK_A = MC ? BK : BK_VEC;
+    constexpr int ThrM_A = (Tm * Tn) / ThrK_A;
+    auto g2s_copy_A = [&]() {
+        if constexpr (MC) {
+            using G2SCopyAtomA = Copy_Atom<UniversalCopy<float>, float>;
+            return make_tiled_copy(G2SCopyAtomA{},
+                make_layout(make_shape(Int<ThrM_A>{}, Int<ThrK_A>{}), LayoutRight{}),
+                make_layout(make_shape(Int<1>{}, Int<1>{})));
+        } else {
+            using G2SCopyAtomA = Copy_Atom<UniversalCopy<uint128_t>, float>;
+            return make_tiled_copy(G2SCopyAtomA{},
+                make_layout(make_shape(Int<ThrM_A>{}, Int<ThrK_A>{}), LayoutRight{}),
+                make_layout(make_shape(Int<1>{}, Int<VEC>{})));
+        }
+    }();
         
     // --- smem layouts: plain (no swizzle) ---
     // B: always K-contiguous (LayoutRight)

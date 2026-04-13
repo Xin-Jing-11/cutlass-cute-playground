@@ -7,6 +7,7 @@
 #include "sgemm_tiling_vectorize.cuh"
 #include "sgemm_warptiling.cuh"
 #include "sgemm_warptiling_vectorize.cuh"
+#include "sgemm_double_buffering.cuh"
 
 #define INSTANTIATE_SGEMM_NAIVE(BLOCK)                                      \
   extern "C" void cutlass_sgemm_naive_##BLOCK(                              \
@@ -38,22 +39,20 @@ INSTANTIATE_SGEMM_SMEM(32)
 
 #undef INSTANTIATE_SGEMM_SMEM
 
-#if 1  // M-contiguous As layout variant
-#define INSTANTIATE_SGEMM_SMEM_MC(BLOCK)                                       \
-  extern "C" void cutlass_sgemm_smem_mc_##BLOCK(                               \
-      int m, int n, int k,                                                      \
-      float alpha,                                                              \
-      const float* A, int ldA,                                                  \
-      const float* B, int ldB,                                                  \
-      float beta,                                                               \
-      float* C, int ldC) {                                                      \
-    sgemm_smem<BLOCK, true>(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);    \
+#define INSTANTIATE_SGEMM_SMEM_MC(BLOCK)                                        \
+  extern "C" void cutlass_sgemm_smem_mc_##BLOCK(                                \
+      int m, int n, int k,                                                       \
+      float alpha,                                                               \
+      const float* A, int ldA,                                                   \
+      const float* B, int ldB,                                                   \
+      float beta,                                                                \
+      float* C, int ldC) {                                                       \
+    sgemm_smem<BLOCK, true>(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);     \
   }
 
 INSTANTIATE_SGEMM_SMEM_MC(32)
 
 #undef INSTANTIATE_SGEMM_SMEM_MC
-#endif
 
 #define INSTANTIATE_SGEMM_TILING(BM, BN, BK, TM, TN)                          \
   extern "C" void cutlass_sgemm_tiling_##BM##x##BN##x##BK##x##TM##x##TN(      \
@@ -72,24 +71,22 @@ INSTANTIATE_SGEMM_TILING(128, 128, 16, 8, 8)
 
 #undef INSTANTIATE_SGEMM_TILING
 
-#if 1  // M-contiguous As layout variant
-#define INSTANTIATE_SGEMM_TILING_MC(BM, BN, BK, TM, TN)                          \
-  extern "C" void cutlass_sgemm_tiling_mc_##BM##x##BN##x##BK##x##TM##x##TN(      \
+#define INSTANTIATE_SGEMM_TILING_MC(BM, BN, BK, TM, TN)                           \
+  extern "C" void cutlass_sgemm_tiling_mc_##BM##x##BN##x##BK##x##TM##x##TN(       \
       int m, int n, int k,                                                         \
       float alpha,                                                                 \
       const float* A, int ldA,                                                     \
       const float* B, int ldB,                                                     \
       float beta,                                                                  \
       float* C, int ldC) {                                                         \
-    sgemm_tiling<BM, BN, BK, TM, TN, true>(m, n, k, alpha, A, ldA, B, ldB,      \
-                                             beta, C, ldC);                        \
+    sgemm_tiling<BM, BN, BK, TM, TN, true>(m, n, k, alpha, A, ldA, B, ldB,       \
+                                            beta, C, ldC);                         \
   }
 
 INSTANTIATE_SGEMM_TILING_MC(64, 64, 16, 8, 8)
 INSTANTIATE_SGEMM_TILING_MC(128, 128, 16, 8, 8)
 
 #undef INSTANTIATE_SGEMM_TILING_MC
-#endif
 
 // sgemm_tiling_vectorize.cuh reuses sgemm_tiling_device kernel, just different copy atoms
 // Use a namespace alias to avoid symbol conflict — the host launcher name differs
@@ -110,6 +107,23 @@ INSTANTIATE_SGEMM_TILING_VECTORIZE(128, 128, 16, 8, 8)
 
 #undef INSTANTIATE_SGEMM_TILING_VECTORIZE
 
+#define INSTANTIATE_SGEMM_TILING_VECTORIZE_MC(BM, BN, BK, TM, TN)                          \
+  extern "C" void cutlass_sgemm_tiling_vectorize_mc_##BM##x##BN##x##BK##x##TM##x##TN(      \
+      int m, int n, int k,                                                                   \
+      float alpha,                                                                           \
+      const float* A, int ldA,                                                               \
+      const float* B, int ldB,                                                               \
+      float beta,                                                                            \
+      float* C, int ldC) {                                                                   \
+    sgemm_tiling_vectorize<BM, BN, BK, TM, TN, true>(m, n, k, alpha, A, ldA, B, ldB,       \
+                                                      beta, C, ldC);                         \
+  }
+
+INSTANTIATE_SGEMM_TILING_VECTORIZE_MC(64, 64, 16, 8, 8)
+INSTANTIATE_SGEMM_TILING_VECTORIZE_MC(128, 128, 16, 8, 8)
+
+#undef INSTANTIATE_SGEMM_TILING_VECTORIZE_MC
+
 #define INSTANTIATE_SGEMM_WARPTILING(BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN) \
   extern "C" void cutlass_sgemm_warptiling_##BM##x##BN##x##BK##x##WM##x##WN##x##WMITER##x##WNITER##x##TM##x##TN( \
       int m, int n, int k,                                                       \
@@ -126,16 +140,16 @@ INSTANTIATE_SGEMM_WARPTILING(128, 128, 16, 64, 64, 1, 4, 8, 4)
 
 #undef INSTANTIATE_SGEMM_WARPTILING
 
-#define INSTANTIATE_SGEMM_WARPTILING_MC(BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN) \
+#define INSTANTIATE_SGEMM_WARPTILING_MC(BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN)        \
   extern "C" void cutlass_sgemm_warptiling_mc_##BM##x##BN##x##BK##x##WM##x##WN##x##WMITER##x##WNITER##x##TM##x##TN( \
-      int m, int n, int k,                                                       \
-      float alpha,                                                               \
-      const float* A, int ldA,                                                   \
-      const float* B, int ldB,                                                   \
-      float beta,                                                                \
-      float* C, int ldC) {                                                       \
-    sgemm_warptiling<BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN, true>(       \
-        m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);                          \
+      int m, int n, int k,                                                                   \
+      float alpha,                                                                           \
+      const float* A, int ldA,                                                               \
+      const float* B, int ldB,                                                               \
+      float beta,                                                                            \
+      float* C, int ldC) {                                                                   \
+    sgemm_warptiling<BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN, true>(                    \
+        m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);                                      \
   }
 
 INSTANTIATE_SGEMM_WARPTILING_MC(128, 128, 16, 64, 64, 1, 4, 8, 4)
@@ -157,3 +171,35 @@ INSTANTIATE_SGEMM_WARPTILING_MC(128, 128, 16, 64, 64, 1, 4, 8, 4)
 INSTANTIATE_SGEMM_WARPTILING_VECTORIZE(128, 128, 16, 64, 64, 1, 4, 8, 4)
 
 #undef INSTANTIATE_SGEMM_WARPTILING_VECTORIZE
+
+#define INSTANTIATE_SGEMM_WARPTILING_VECTORIZE_MC(BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN) \
+  extern "C" void cutlass_sgemm_warptiling_vectorize_mc_##BM##x##BN##x##BK##x##WM##x##WN##x##WMITER##x##WNITER##x##TM##x##TN( \
+      int m, int n, int k,                                                                      \
+      float alpha,                                                                              \
+      const float* A, int ldA,                                                                  \
+      const float* B, int ldB,                                                                  \
+      float beta,                                                                               \
+      float* C, int ldC) {                                                                      \
+    sgemm_warptiling_vectorize<BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN, true>(             \
+        m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);                                         \
+  }
+
+INSTANTIATE_SGEMM_WARPTILING_VECTORIZE_MC(128, 128, 16, 64, 64, 1, 4, 8, 4)
+
+#undef INSTANTIATE_SGEMM_WARPTILING_VECTORIZE_MC
+
+#define INSTANTIATE_SGEMM_DOUBLE_BUFFERING(BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN) \
+  extern "C" void cutlass_sgemm_double_buffering_##BM##x##BN##x##BK##x##WM##x##WN##x##WMITER##x##WNITER##x##TM##x##TN( \
+      int m, int n, int k,                                                       \
+      float alpha,                                                               \
+      const float* A, int ldA,                                                   \
+      const float* B, int ldB,                                                   \
+      float beta,                                                                \
+      float* C, int ldC) {                                                       \
+    sgemm_double_buffering<BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN>(       \
+        m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);                          \
+  }
+
+INSTANTIATE_SGEMM_DOUBLE_BUFFERING(128, 128, 16, 64, 64, 1, 4, 8, 4)
+
+#undef INSTANTIATE_SGEMM_DOUBLE_BUFFERING
