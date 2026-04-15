@@ -283,13 +283,13 @@ __device__ __forceinline__ void epilogue_store(
 //       wait<0> → sync                              // tile (i+1) landed
 //   epilogue : compute on final tile, write C
 // -----------------------------------------------------------------------------
-// KC=true:  K-contiguous As[m*BK+k], Swizzle<B-2,2,S>, vectorized 128-bit g2s
-// KC=false: M-contiguous As[k*BM+m], Swizzle<B,0,S>,   scalar 32-bit g2s
+// MC=false: K-contiguous As[m*BK+k], Swizzle<B-2,2,S>, vectorized 128-bit g2s
+// MC=true:  M-contiguous As[k*BM+m], Swizzle<B,0,S>,   scalar 32-bit g2s
 template <int BM = 128, int BN = 128, int BK = 8,
     int WM = 64, int WN = 64,
     int WMITER = 2, int WNITER = 2,
     int TM = 8, int TN = 4,
-    bool KC = false>
+    bool MC = false>
 __global__
 __launch_bounds__((BM / WM) * (BN / WN) * 32)
 void sgemm_double_buffering_kernel(
@@ -315,9 +315,9 @@ void sgemm_double_buffering_kernel(
     constexpr int SWZ_B = __builtin_ctz(BK);
     constexpr int THR_M = NTM * NWM;
     constexpr int ATOM_M = (THR_M >= BK) ? THR_M : BK;
-    // KC: Swizzle<B-2, 2, ctz(ATOM_M)> on As[m*BK+k]
-    // MC: Swizzle<B,   0, ctz(BM)>     on As[k*BM+m]
-    constexpr int SWZ_S = KC ? __builtin_ctz(ATOM_M) : __builtin_ctz(BM);
+    // MC=false (KC): Swizzle<B-2, 2, ctz(ATOM_M)> on As[m*BK+k]
+    // MC=true:       Swizzle<B,   0, ctz(BM)>     on As[k*BM+m]
+    constexpr int SWZ_S = MC ? __builtin_ctz(BM) : __builtin_ctz(ATOM_M);
 
     // block origin in gmem
     const int bm = blockIdx.x * BM;
@@ -342,7 +342,7 @@ void sgemm_double_buffering_kernel(
     auto pipe = cuda::make_pipeline();
 
     // prologue: issue stage 0 and wait for it
-    if constexpr (KC) {
+    if constexpr (!MC) {
         db::load_A_gmem_to_smem_vec<BM, BK, NUM_THREADS, SWZ_B, SWZ_S>(
             A, K, As[0], threadIdx.x, pipe);
     } else {
@@ -364,7 +364,7 @@ void sgemm_double_buffering_kernel(
         B += BK;
 
         // issue next stage — cp.async runs in parallel with the compute below
-        if constexpr (KC) {
+        if constexpr (!MC) {
             db::load_A_gmem_to_smem_vec<BM, BK, NUM_THREADS, SWZ_B, SWZ_S>(
                 A, K, As[write], threadIdx.x, pipe);
         } else {
@@ -378,7 +378,7 @@ void sgemm_double_buffering_kernel(
         // compute on current (read) stage
         #pragma unroll
         for (int k = 0; k < BK; k++) {
-            if constexpr (KC) {
+            if constexpr (!MC) {
                 db::load_A_smem_to_reg_vec<BM, BK, WM, WMITER, TM, NTM, SWZ_B, SWZ_S>(
                     As[read], k, warpIdm, thrIdm, regM);
             } else {
@@ -402,7 +402,7 @@ void sgemm_double_buffering_kernel(
     // epilogue: compute on final tile
     #pragma unroll
     for (int k = 0; k < BK; k++) {
-        if constexpr (KC) {
+        if constexpr (!MC) {
             db::load_A_smem_to_reg_vec<BM, BK, WM, WMITER, TM, NTM, SWZ_B, SWZ_S>(
                 As[read], k, warpIdm, thrIdm, regM);
         } else {
@@ -423,7 +423,7 @@ template <int BM = 128, int BN = 128, int BK = 8,
     int WM = 64, int WN = 64,
     int WMITER = 2, int WNITER = 2,
     int TM = 8, int TN = 4,
-    bool KC = false>
+    bool MC = false>
 void sgemm_double_buffering(
     int M, int N, int K,
     float alpha,
@@ -434,6 +434,6 @@ void sgemm_double_buffering(
     dim3 block((BM / WM) * (BN / WN) * 32);
     dim3 grid(CEIL_DIV(M, BM), CEIL_DIV(N, BN));
     sgemm_double_buffering_kernel<
-        BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN, KC>
+        BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN, MC>
         <<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
 }

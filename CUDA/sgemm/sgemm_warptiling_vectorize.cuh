@@ -23,10 +23,12 @@ namespace wtv {
 
 // -----------------------------------------------------------------------------
 // gmem → smem (vectorized, 128-bit float4): load BM x BK tile of A.
-// Reads one float4 per iteration from gmem and scatters the 4 scalars into
-// M-contiguous swizzled smem slots.
+// MC: Reads one float4 per iteration from gmem and scatters the 4 scalars into
+//     M-contiguous swizzled smem slots As[k*BM+m].
+// KC: Both gmem and smem are K-contiguous As[m*BK+k], so a single float4
+//     store suffices (no scatter). Uses Swizzle<B-2,2,S>.
 // -----------------------------------------------------------------------------
-template <int BM, int BK, int NUM_THREADS, int SWZ_B, int SWZ_S>
+template <int BM, int BK, int NUM_THREADS, int SWZ_B, int SWZ_S, bool MC>
 __device__ __forceinline__ void load_A_gmem_to_smem_vec(
     const float* __restrict__ A, int K, float* As, int tid)
 {
@@ -42,11 +44,16 @@ __device__ __forceinline__ void load_A_gmem_to_smem_vec(
     #pragma unroll
     for (int i = 0; i < iterA; i++) {
         const int m = idxAm + i * nrowsA;
-        float4 tmp = reinterpret_cast<const float4*>(&A[m * K + idxAk])[0];
-        As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 0) * BM + m)] = tmp.x;
-        As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 1) * BM + m)] = tmp.y;
-        As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 2) * BM + m)] = tmp.z;
-        As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 3) * BM + m)] = tmp.w;
+        if constexpr (MC) {
+            float4 tmp = reinterpret_cast<const float4*>(&A[m * K + idxAk])[0];
+            As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 0) * BM + m)] = tmp.x;
+            As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 1) * BM + m)] = tmp.y;
+            As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 2) * BM + m)] = tmp.z;
+            As[swizzle<SWZ_B, 0, SWZ_S>((idxAk + 3) * BM + m)] = tmp.w;
+        } else {
+            reinterpret_cast<float4*>(&As[swizzle<SWZ_B-2, 2, SWZ_S>(m * BK + idxAk)])[0] =
+                reinterpret_cast<const float4*>(&A[m * K + idxAk])[0];
+        }
     }
 }
 
@@ -78,9 +85,11 @@ __device__ __forceinline__ void load_B_gmem_to_smem_vec(
 
 // -----------------------------------------------------------------------------
 // smem → reg: gather this thread's M-slice of As for a fixed k into regM.
+// MC: M-contiguous As[k*BM+m], Swizzle<B,0,S>.
+// KC: K-contiguous As[m*BK+k], Swizzle<B-2,2,S>.
 // -----------------------------------------------------------------------------
 template <int BM, int BK, int WM, int WMITER, int TM, int NTM,
-          int SWZ_B, int SWZ_S>
+          int SWZ_B, int SWZ_S, bool MC>
 __device__ __forceinline__ void load_A_smem_to_reg(
     const float* As, int k, int warpIdm, int thrIdm, float* regM)
 {
@@ -93,7 +102,11 @@ __device__ __forceinline__ void load_A_smem_to_reg(
         #pragma unroll
         for (int i = 0; i < TM; i++) {
             const int m = offset_m + thrIdm + i * NTM;
-            regM[i + wmi * TM] = As[swizzle<SWZ_B, 0, SWZ_S>(k * BM + m)];
+            if constexpr (MC) {
+                regM[i + wmi * TM] = As[swizzle<SWZ_B, 0, SWZ_S>(k * BM + m)];
+            } else {
+                regM[i + wmi * TM] = As[swizzle<SWZ_B-2, 2, SWZ_S>(m * BK + k)];
+            }
         }
     }
 }
@@ -182,11 +195,15 @@ __device__ __forceinline__ void epilogue_store(
 // Main kernel — composes the helpers in wtv.
 // Same algorithm as sgemm_warptiling_kernel, but the gmem→smem stage uses
 // 128-bit (float4) loads for better global memory throughput.
+//
+// MC=false: K-contiguous As[m*BK+k], Swizzle<B-2,2,S>, direct float4 store
+// MC=true:  M-contiguous As[k*BM+m], Swizzle<B,0,S>,   scatter float4 store
 // -----------------------------------------------------------------------------
 template <int BM = 128, int BN = 128, int BK = 8,
     int WM = 64, int WN = 64,
     int WMITER = 2, int WNITER = 2,
-    int TM = 8, int TN = 4>
+    int TM = 8, int TN = 4,
+    bool MC = false>
 __global__ void sgemm_warptiling_vectorize_kernel(
     int M, int N, int K,
     float alpha,
@@ -206,10 +223,13 @@ __global__ void sgemm_warptiling_vectorize_kernel(
     constexpr int NTM = WSUBM / TM;
     constexpr int NTN = WSUBN / TN;
 
-    // swizzle params for As (M-contiguous As[k*BM+m]):
-    // thrIdm at bits[0..ctz(NTM)), k at bits[ctz(BM)...) → XOR m with k
+    // swizzle params — layout-dependent
     constexpr int SWZ_B = __builtin_ctz(BK);
-    constexpr int SWZ_S = __builtin_ctz(BM);
+    constexpr int THR_M = NTM * NWM;
+    constexpr int ATOM_M = (THR_M >= BK) ? THR_M : BK;
+    // MC=false (KC): Swizzle<B-2, 2, ctz(ATOM_M)> on As[m*BK+k]
+    // MC=true:       Swizzle<B,   0, ctz(BM)>     on As[k*BM+m]
+    constexpr int SWZ_S = MC ? __builtin_ctz(BM) : __builtin_ctz(ATOM_M);
 
     // block origin in gmem
     const int bm = blockIdx.x * BM;
@@ -234,7 +254,7 @@ __global__ void sgemm_warptiling_vectorize_kernel(
 
     // mainloop over K
     for (int bk = 0; bk < K; bk += BK) {
-        wtv::load_A_gmem_to_smem_vec<BM, BK, NUM_THREADS, SWZ_B, SWZ_S>(
+        wtv::load_A_gmem_to_smem_vec<BM, BK, NUM_THREADS, SWZ_B, SWZ_S, MC>(
             A, K, As, threadIdx.x);
         wtv::load_B_gmem_to_smem_vec<BN, BK, NUM_THREADS>(
             B, K, Bs, threadIdx.x);
@@ -245,7 +265,7 @@ __global__ void sgemm_warptiling_vectorize_kernel(
 
         #pragma unroll
         for (int k = 0; k < BK; k++) {
-            wtv::load_A_smem_to_reg<BM, BK, WM, WMITER, TM, NTM, SWZ_B, SWZ_S>(
+            wtv::load_A_smem_to_reg<BM, BK, WM, WMITER, TM, NTM, SWZ_B, SWZ_S, MC>(
                 As, k, warpIdm, thrIdm, regM);
             wtv::load_B_smem_to_reg<BK, WN, WNITER, TN, NTN>(
                 Bs, k, warpIdn, thrIdn, regN);
@@ -261,7 +281,8 @@ __global__ void sgemm_warptiling_vectorize_kernel(
 template <int BM = 128, int BN = 128, int BK = 8,
     int WM = 64, int WN = 64,
     int WMITER = 2, int WNITER = 2,
-    int TM = 8, int TN = 4>
+    int TM = 8, int TN = 4,
+    bool MC = false>
 void sgemm_warptiling_vectorize(
     int M, int N, int K,
     float alpha,
@@ -271,6 +292,6 @@ void sgemm_warptiling_vectorize(
 {
     dim3 block((BM / WM) * (BN / WN) * 32);
     dim3 grid(CEIL_DIV(M, BM), CEIL_DIV(N, BN));
-    sgemm_warptiling_vectorize_kernel<BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN>
+    sgemm_warptiling_vectorize_kernel<BM, BN, BK, WM, WN, WMITER, WNITER, TM, TN, MC>
         <<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
 }
