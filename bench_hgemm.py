@@ -71,10 +71,8 @@ CUTLASS_VARIANTS = _discover_hgemm_variants(
     "cutlass_hgemm_",
 )
 
-CUTEDSL_VARIANTS = {
-    "naive": ("CuTeDSL.hgemm.hgemm_naive", "HgemmNaive", {}),
-    "mma_128x128x32": ("CuTeDSL.hgemm.hgemm_mma", "HgemmMma", {}),
-}
+from CuTeDSL.hgemm.instantiate import VARIANTS as _HGEMM_DSL_VARIANTS
+CUTEDSL_VARIANTS = _HGEMM_DSL_VARIANTS
 
 METHOD_RUNNERS = {}   # populated below after runner definitions
 
@@ -199,21 +197,28 @@ def bench_cutedsl(M, N, K, warmup=5, iters=20):
     D_t = from_dlpack(D_d, assumed_align=16)     # (M,N):(1,M)
 
     results = []
-    for variant_name, (module_path, class_name, kwargs) in sorted(CUTEDSL_VARIANTS.items()):
+    for variant_name, (gemm_cls, kwargs) in sorted(CUTEDSL_VARIANTS.items()):
         name = f"cutedsl:{variant_name}"
         key = (variant_name, M, N, K)
         try:
-            def compile_fn():
-                if key not in _cutedsl_compiled:
-                    import importlib
-                    mod = importlib.import_module(module_path)
-                    gemm_cls = getattr(mod, class_name)
-                    _cutedsl_compiled[key] = cute.compile(
-                        gemm_cls(**kwargs), A_t, B_t, C_t, D_t
-                    )
+            # Detect 3-tensor (in-place C) vs 4-tensor (separate C+D) interface
+            import inspect
+            sig = inspect.signature(gemm_cls.__call__)
+            # Count tensor params (cute.Tensor annotations before alpha)
+            n_tensors = sum(1 for p in list(sig.parameters.values())[1:]  # skip self
+                           if p.annotation is cute.Tensor)
+            if n_tensors == 3:
+                tensors = (A_t, B_t, C_t)
+            else:
+                tensors = (A_t, B_t, C_t, D_t)
 
+            def compile_fn(ts=tensors):
+                if key not in _cutedsl_compiled:
+                    _cutedsl_compiled[key] = cute.compile(
+                        gemm_cls(**kwargs), *ts
+                    )
                 compiled = _cutedsl_compiled[key]
-                return lambda: compiled(A_t, B_t, C_t, D_t)
+                return lambda: compiled(*ts)
 
             ms, _ = compile_and_benchmark_gpu(compile_fn, warmup=warmup, iters=iters)
             results.append((name, ms, None))
