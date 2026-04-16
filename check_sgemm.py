@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-SGEMM Accuracy Check: verify registered variants against a NumPy reference.
+SGEMM Accuracy Check: verify registered variants against a cuBLAS reference.
 
 Examples:
     python check_sgemm.py
@@ -26,6 +26,7 @@ from bench_utils import (
     gpu_sync,
     load_cuda_lib,
     load_cutlass_lib,
+    setup_cublas,
     to_gpu,
 )
 
@@ -65,21 +66,60 @@ def resolve_problem_shape(args):
     return M, N, K
 
 
-def reference_problem(M, N, K):
-    """TN layout: D = alpha * A^T * B + beta * C.
+def cublas_reference(M, N, K):
+    """Run cuBLAS SGEMM and return (A, B, C, D_ref).
+
+    TN col-major layout: D = alpha * A^T * B + beta * C.
     A stored (K,M) col-major, B stored (K,N) col-major, C stored (M,N) col-major.
+    D_ref is the cuBLAS FP32 output.
     """
+    blas, handle = setup_cublas()
+
     np.random.seed(42)
-    A = np.asfortranarray(np.random.randn(K, M).astype(np.float32))   # (K,M) col-major
-    B = np.asfortranarray(np.random.randn(K, N).astype(np.float32))   # (K,N) col-major
-    C = np.asfortranarray(np.random.randn(M, N).astype(np.float32))   # (M,N) col-major
-    D_ref = (A.T @ B + C).astype(np.float32)
+    A = np.asfortranarray(np.random.randn(K, M).astype(np.float32))
+    B = np.asfortranarray(np.random.randn(K, N).astype(np.float32))
+    C = np.asfortranarray(np.random.randn(M, N).astype(np.float32))
+
+    dA = dB = dC = None
+    try:
+        dA = to_gpu(A)
+        dB = to_gpu(B)
+        dC = to_gpu(C)
+
+        alpha = np.array([1.0], dtype=np.float32)
+        beta = np.array([1.0], dtype=np.float32)
+
+        CUBLAS_OP_T = 1
+        CUBLAS_OP_N = 0
+        CUDA_R_32F = 0
+        CUBLAS_COMPUTE_32F = 68
+        CUBLAS_GEMM_DEFAULT = -1
+
+        blas.cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            M, N, K,
+            alpha.ctypes.data,
+            ctypes.c_void_p(dA), CUDA_R_32F, K,
+            ctypes.c_void_p(dB), CUDA_R_32F, K,
+            beta.ctypes.data,
+            ctypes.c_void_p(dC), CUDA_R_32F, M,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+        )
+        gpu_sync()
+
+        D_ref = from_gpu(dC, (M, N), np.float32, order="F")
+    finally:
+        for ptr in (dA, dB, dC):
+            if ptr is not None:
+                safe_gpu_free(ptr)
+        blas.cublasDestroy_v2(handle)
+
     return A, B, C, D_ref
 
 
 def check_cuda(M, N, K, atol, rtol, variant=None):
     lib = load_cuda_lib()
-    A, B, C, D_ref = reference_problem(M, N, K)
+    A, B, C, D_ref = cublas_reference(M, N, K)
 
     results = []
     for variant_name, symbol_name in sorted(CUDA_VARIANTS.items()):
@@ -123,7 +163,7 @@ def check_cuda(M, N, K, atol, rtol, variant=None):
 
 def check_cutlass(M, N, K, atol, rtol, variant=None):
     lib = load_cutlass_lib()
-    A, B, C, D_ref = reference_problem(M, N, K)
+    A, B, C, D_ref = cublas_reference(M, N, K)
 
     results = []
     for variant_name, symbol_name in sorted(CUTLASS_VARIANTS.items()):
@@ -169,7 +209,7 @@ def check_cutedsl(M, N, K, atol, rtol, variant=None):
     import cupy as cp
     from cutlass.cute.runtime import from_dlpack
 
-    A, B, C, D_ref = reference_problem(M, N, K)
+    A, B, C, D_ref = cublas_reference(M, N, K)
 
     # A is (K,M) col-major, B is (K,N) col-major, C is (M,N) col-major
     A_d = cp.array(A, order="F")      # (K,M) on GPU
@@ -223,7 +263,7 @@ def main():
     args = parse_args()
     M, N, K = resolve_problem_shape(args)
 
-    print("SGEMM Accuracy Check")
+    print("SGEMM Accuracy Check (cuBLAS reference)")
     print(f"Problem: M={M}, N={N}, K={K}")
     print(f"Selected: method={args.method}")
     if args.variant is not None:

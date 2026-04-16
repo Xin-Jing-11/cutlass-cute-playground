@@ -44,7 +44,16 @@ include_directories(
 )
 
 # Collect instantiation files from kernel subdirectories
-file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*/instantiate.cu)
+# Use -DKERNEL_TYPES="sgemm;hgemm" to build only specific types (default: all)
+if(KERNEL_TYPES)
+    set(KERNEL_SOURCES "")
+    foreach(kt ${KERNEL_TYPES})
+        file(GLOB _kt_src ${CMAKE_CURRENT_SOURCE_DIR}/${kt}/instantiate.cu)
+        list(APPEND KERNEL_SOURCES ${_kt_src})
+    endforeach()
+else()
+    file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*/instantiate.cu)
+endif()
 
 # Shared library exposing C entry points for Python (ctypes)
 add_library(cutlass_kernels SHARED ${KERNEL_SOURCES})

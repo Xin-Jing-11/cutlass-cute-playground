@@ -34,7 +34,16 @@ set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 # Collect instantiation files from kernel subdirectories
-file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*/instantiate.cu)
+# Use -DKERNEL_TYPES="sgemm;hgemm" to build only specific types (default: all)
+if(KERNEL_TYPES)
+    set(KERNEL_SOURCES "")
+    foreach(kt ${KERNEL_TYPES})
+        file(GLOB _kt_src ${CMAKE_CURRENT_SOURCE_DIR}/${kt}/instantiate.cu)
+        list(APPEND KERNEL_SOURCES ${_kt_src})
+    endforeach()
+else()
+    file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*/instantiate.cu)
+endif()
 
 if(KERNEL_SOURCES)
     add_library(cuda_kernels SHARED ${KERNEL_SOURCES})
