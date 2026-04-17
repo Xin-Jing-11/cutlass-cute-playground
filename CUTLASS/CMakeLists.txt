@@ -15,6 +15,13 @@ else()
 endif()
 message(STATUS "Detected GPU architecture: ${CUDA_ARCH_LIST}")
 
+# Add sm_90a if we want WGMMA atoms to compile. Needed by hgemm_wgmma.
+# Note: sm_90a-compiled code only *executes* on Hopper (H100/H200).
+# On Blackwell consumer (SM120), the binary builds but the WGMMA kernel
+# falls through to CUTE_INVALID_CONTROL_PATH at runtime.
+list(APPEND CUDA_ARCH_LIST "90a")
+list(REMOVE_DUPLICATES CUDA_ARCH_LIST)
+
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)

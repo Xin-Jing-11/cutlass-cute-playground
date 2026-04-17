@@ -4,10 +4,10 @@
 #include <cute/atom/mma_atom.hpp>
 
 /*
- * Basic tensor-core HGEMM using CuTe: C = alpha * A^T * B + beta * C   (TN layout)
+ * Warp-level tensor-core HGEMM using CuTe: C = alpha * A^T * B + beta * C   (TN layout)
  * A(M,K):(K,1), B(N,K):(K,1), C(M,N):(1,M).
  *
- * Uses SM80_16x8x16_F32F16F16F32_TN (mma.sync, works on SM80+).
+ * Uses SM80_16x8x16_F32F16F16F32_TN (mma.sync, warp-level, synchronous).
  * Swizzled smem to reduce bank conflicts, no double buffering.
  */
 
@@ -17,7 +17,7 @@ template <class ProblemShape, class CtaTiler,
     class CStride, class TiledMMA>
 __global__ static
 __launch_bounds__(decltype(cute::size(TiledMMA{}))::value)
-void hgemm_mma_device(
+void hgemm_wmma_device(
     ProblemShape shape_MNK, CtaTiler cta_tiler,
     float alpha,
     const cute::half_t* A, AStride dA, TiledCopyA g2s_A, S2RCopyA s2r_A, ASmemLayout sA_layout,
@@ -95,7 +95,7 @@ void hgemm_mma_device(
 // Host launcher
 // ---------------------------------------------------------------------------
 template <int BM = 128, int BN = 128, int BK = 32>
-void hgemm_mma(
+void hgemm_wmma(
     int m, int n, int k,
     float alpha,
     const cute::half_t* A, int ldA,
@@ -180,7 +180,7 @@ void hgemm_mma(
     dim3 grid(size(ceil_div(m, Int<BM>{})),
               size(ceil_div(n, Int<BN>{})));
 
-    hgemm_mma_device<<<grid, block>>>(
+    hgemm_wmma_device<<<grid, block>>>(
         shape_MNK, cta_tiler, alpha,
         A, dA, g2s_copy_A, s2r_copy_A, sA_layout,
         B, dB, g2s_copy_B, s2r_copy_B, sB_layout,
