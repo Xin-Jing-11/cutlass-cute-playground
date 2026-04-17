@@ -15,20 +15,9 @@ from CuTeDSL.sgemm.sgemm_tiling import SgemmTiling
 from CuTeDSL.sgemm.sgemm_tiling_vectorize import SgemmTilingVectorize
 
 VARIANTS = {
-    # naive
-    "naive":                        (SgemmNaive, dict(block_size=32)),
-
-    # smem
-    "smem":                         (SgemmSmem, dict(block_size=32)),
-    "smem_mc":                      (SgemmSmem, dict(block_size=32, mc=True)),
-
-    # tiling (only 128x128 with BK=16 — see NOTE above for why 64x64 is excluded)
-    "tiling_64x64x8x8x8":           (SgemmTiling, dict(bm=64, bn=64, bk=8, tm=8, tn=8)),
-    "tiling_128x128x16x8x8":        (SgemmTiling, dict(bm=128, bn=128, bk=16, tm=8, tn=8)),
-    "tiling_mc_64x64x8x8x8":        (SgemmTiling, dict(bm=64, bn=64, bk=8, tm=8, tn=8, mc=True)),
-    "tiling_mc_128x128x16x8x8":     (SgemmTiling, dict(bm=128, bn=128, bk=16, tm=8, tn=8, mc=True)),
-
-    # tiling_vectorize (128-bit g2s + Swizzle<B,2,S> on sA, no MC)
-    # 64x64 config disabled: trips NVIDIA/cutlass#3160 (swizzled ComposedLayout + CPY>1 tiling)
-    "tiling_vectorize_128x128x16x8x8":     (SgemmTilingVectorize, dict(bm=128, bn=128, bk=16, tm=8, tn=8)),
+    # Only fastest config per family kept (based on bench_sgemm @ 4096):
+    "naive":                             (SgemmNaive, dict(block_size=32)),
+    "smem":                              (SgemmSmem, dict(block_size=32)),     # non-mc faster
+    "tiling_64x64x8x8x8":                (SgemmTiling, dict(bm=64, bn=64, bk=8, tm=8, tn=8)),
+    "tiling_vectorize_128x128x16x8x8":   (SgemmTilingVectorize, dict(bm=128, bn=128, bk=16, tm=8, tn=8)),
 }
