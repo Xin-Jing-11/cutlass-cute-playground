@@ -17,6 +17,10 @@ else()
 endif()
 message(STATUS "Detected GPU architecture: ${CUDA_ARCH_LIST}")
 
+# Upgrade "120" -> "120a" so TMA PTX (cp.async.bulk.tensor.*.shared::cta)
+# compiles correctly for SM120 consumer Blackwell.
+list(TRANSFORM CUDA_ARCH_LIST REPLACE "^120$" "120a")
+
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
@@ -47,7 +51,8 @@ endif()
 
 if(KERNEL_SOURCES)
     add_library(cuda_kernels SHARED ${KERNEL_SOURCES})
-    target_link_libraries(cuda_kernels stdc++)
+    # cuda (driver stub) is needed for cuTensorMapEncodeTiled used by hgemm_tma.
+    target_link_libraries(cuda_kernels stdc++ cuda)
     set_target_properties(cuda_kernels PROPERTIES
         POSITION_INDEPENDENT_CODE ON
     )

@@ -1,18 +1,17 @@
 """
-Tensor-core HGEMM using CuTe DSL (TN): D = alpha * A^T * B + beta * C
+Tensor-core HGEMM with ldmatrix s2r using CuTe DSL (TN).
 
-Mirrors CUTLASS/hgemm/hgemm_mma.cuh:
+Mirrors CUTLASS/hgemm/hgemm_wmma_ldmatrix.cuh:
   - SM80 warp-level MMA: 16×8×16, F16 inputs, F32 accumulator
-  - Tiled 2×2×1 warps → 128 threads, 32×16 per MMA step
+  - Tiled 2×2×1 warps → 128 threads
   - 128-bit vectorized gmem→smem copies
-  - Scalar smem→register copies retiled to match MMA layout
-  - No swizzle: CuTeDSL has a known bug where ComposedLayout + multi-K
-    s2r iteration produces wrong results (works in C++ CuTe).
-    The C++ version uses Swizzle<2,3,6> on both sA and sB.
+  - ldmatrix smem→register (warp-cooperative 8×8 half-tile loads):
+    LdMatrix8x8x16bOp(num_matrices=4) for A, num_matrices=2 for B.
+  - No smem swizzle (CuTeDSL ComposedLayout + multi-K bug).
 
 A stored (K,M) col-major → CuTe (M,K):(K,1).
 B stored (K,N) col-major → CuTe (N,K):(K,1).
-C stored (M,N) col-major → CuTe (M,N):(1,M)  — in-place: C = alpha * A^T * B + beta * C.
+C stored (M,N) col-major → CuTe (M,N):(1,M)  — in-place.
 Half in/out, float32 accumulator.
 """
 
@@ -26,7 +25,7 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import nvgpu
-from cutlass.cute.nvgpu.warp import MmaF16BF16Op
+from cutlass.cute.nvgpu.warp import MmaF16BF16Op, LdMatrix8x8x16bOp
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -104,11 +103,17 @@ class HgemmMma:
         # ---------------------------------------------------------------
         # smem → register: scalar copies, retiled to match MMA layout
         # ---------------------------------------------------------------
-        s2r_atom = cute.make_copy_atom(
-            nvgpu.CopyUniversalOp(), cutlass.Float16,
-            num_bits_per_copy=cutlass.Float16.width)
-        s2r_copy_A = cute.make_tiled_copy_A(s2r_atom, tiled_mma)
-        s2r_copy_B = cute.make_tiled_copy_B(s2r_atom, tiled_mma)
+        # ldmatrix: warp-cooperative 8x8 half tile loads
+        # A: 16x16 tile = 4 × 8x8 matrices
+        # B: 8x16 tile  = 2 × 8x8 matrices
+        s2r_atom_A = cute.make_copy_atom(
+            LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            cutlass.Float16)
+        s2r_atom_B = cute.make_copy_atom(
+            LdMatrix8x8x16bOp(transpose=False, num_matrices=2),
+            cutlass.Float16)
+        s2r_copy_A = cute.make_tiled_copy_A(s2r_atom_A, tiled_mma)
+        s2r_copy_B = cute.make_tiled_copy_B(s2r_atom_B, tiled_mma)
 
         # ---------------------------------------------------------------
         # Launch

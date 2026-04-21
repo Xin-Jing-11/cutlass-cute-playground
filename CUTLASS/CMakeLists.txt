@@ -20,6 +20,12 @@ message(STATUS "Detected GPU architecture: ${CUDA_ARCH_LIST}")
 # On Blackwell consumer (SM120), the binary builds but the WGMMA kernel
 # falls through to CUTE_INVALID_CONTROL_PATH at runtime.
 list(APPEND CUDA_ARCH_LIST "90a")
+
+# Upgrade "120" -> "120a": hgemm_tma uses SM90 TMA intrinsics. The SM120
+# (shared::cta) PTX variant is only emitted when CUTLASS_ARCH_MMA_SM120A_ENABLED
+# is defined, which needs sm_120a (not plain sm_120). Without this, TMA hits
+# CUTE_INVALID_CONTROL_PATH on SM120.
+list(TRANSFORM CUDA_ARCH_LIST REPLACE "^120$" "120a")
 list(REMOVE_DUPLICATES CUDA_ARCH_LIST)
 
 set(CMAKE_CUDA_STANDARD 17)
@@ -64,7 +70,7 @@ endif()
 
 # Shared library exposing C entry points for Python (ctypes)
 add_library(cutlass_kernels SHARED ${KERNEL_SOURCES})
-target_link_libraries(cutlass_kernels cublas -static-libstdc++)
+target_link_libraries(cutlass_kernels cublas cuda -static-libstdc++)
 set_target_properties(cutlass_kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON

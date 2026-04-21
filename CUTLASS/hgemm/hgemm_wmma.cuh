@@ -2,13 +2,15 @@
 #include <cute/tensor.hpp>
 #include <cute/atom/copy_atom.hpp>
 #include <cute/atom/mma_atom.hpp>
+#include <cute/arch/copy_sm75.hpp>
 
 /*
  * Warp-level tensor-core HGEMM using CuTe: C = alpha * A^T * B + beta * C   (TN layout)
  * A(M,K):(K,1), B(N,K):(K,1), C(M,N):(1,M).
  *
  * Uses SM80_16x8x16_F32F16F16F32_TN (mma.sync, warp-level, synchronous).
- * Swizzled smem to reduce bank conflicts, no double buffering.
+ * Swizzled smem + ldmatrix s2r: warp-cooperative 8x8 half-tile loads,
+ * bank-conflict free. No double buffering.
  */
 
 template <class ProblemShape, class CtaTiler,
@@ -169,9 +171,14 @@ void hgemm_wmma(
     // ---------------------------------------------------------------
     // smem → register: scalar copies, retiled to match MMA layout
     // ---------------------------------------------------------------
-    using S2RCopyAtom = Copy_Atom<UniversalCopy<cute::half_t>, cute::half_t>;
-    auto s2r_copy_A = make_tiled_copy_A(S2RCopyAtom{}, mma);
-    auto s2r_copy_B = make_tiled_copy_B(S2RCopyAtom{}, mma);
+    // ldmatrix: warp-cooperative 8x8 half tile loads, bank-conflict free
+    // copyA need to move 16x16 half, need U32x4_N, each thread read contiguous 128 bits
+    // copyB need to move 16x8 half, only need U32x2_N
+    // both smem and register k-contiguous thus no transposed needed.
+    using S2RCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, cute::half_t>;
+    using S2RCopyAtomB = Copy_Atom<SM75_U32x2_LDSM_N, cute::half_t>;
+    auto s2r_copy_A = make_tiled_copy_A(S2RCopyAtomA{}, mma);
+    auto s2r_copy_B = make_tiled_copy_B(S2RCopyAtomB{}, mma);
 
     // ---------------------------------------------------------------
     // Launch

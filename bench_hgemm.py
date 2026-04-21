@@ -24,6 +24,7 @@ from bench_utils import (
     gflops,
     gpu_free,
     gpu_time_ms,
+    load_cuda_lib,
     load_cutlass_lib,
     setup_cublas,
     to_gpu,
@@ -69,6 +70,10 @@ def _discover_hgemm_variants(instantiate_path, symbol_prefix):
 CUTLASS_VARIANTS = _discover_hgemm_variants(
     os.path.join(ROOT, "CUTLASS", "hgemm", "instantiate.cu"),
     "cutlass_hgemm_",
+)
+CUDA_VARIANTS = _discover_hgemm_variants(
+    os.path.join(ROOT, "CUDA", "hgemm", "instantiate.cu"),
+    "cuda_hgemm_",
 )
 
 from CuTeDSL.hgemm.instantiate import VARIANTS as _HGEMM_DSL_VARIANTS
@@ -175,6 +180,50 @@ def bench_cutlass(M, N, K, warmup=5, iters=20):
 
 
 # ---------------------------------------------------------------------------
+# CUDA C++ HGEMM (TN col-major, in-place C — same calling convention as CUTLASS)
+# ---------------------------------------------------------------------------
+def bench_cuda(M, N, K, warmup=5, iters=20):
+    lib = load_cuda_lib()
+
+    results = []
+    for variant_name, symbol_name in sorted(CUDA_VARIANTS.items()):
+        name = f"cuda:{variant_name}"
+        dA = dB = dC = None
+        try:
+            A_h = np.asfortranarray(np.random.randn(K, M).astype(np.float16))
+            B_h = np.asfortranarray(np.random.randn(K, N).astype(np.float16))
+            C_h = np.asfortranarray(np.zeros((M, N), dtype=np.float16))
+
+            dA = to_gpu(A_h)
+            dB = to_gpu(B_h)
+            dC = to_gpu(C_h)
+
+            kernel = getattr(lib, symbol_name)
+
+            def run():
+                kernel(
+                    M, N, K,
+                    ctypes.c_float(1.0),
+                    ctypes.c_void_p(dA), K,
+                    ctypes.c_void_p(dB), K,
+                    ctypes.c_float(0.0),
+                    ctypes.c_void_p(dC), M,
+                )
+
+            ms = gpu_time_ms(run, warmup, iters)
+            results.append((name, ms, None))
+        except Exception as err:
+            results.append((name, None, err))
+        finally:
+            for ptr in (dA, dB, dC):
+                if ptr is not None:
+                    safe_gpu_free(ptr)
+
+    results.sort(key=lambda item: float("inf") if item[1] is None else item[1])
+    return results
+
+
+# ---------------------------------------------------------------------------
 # CuTe DSL HGEMM
 # ---------------------------------------------------------------------------
 def bench_cutedsl(M, N, K, warmup=5, iters=20):
@@ -230,6 +279,7 @@ def bench_cutedsl(M, N, K, warmup=5, iters=20):
 
 
 METHOD_RUNNERS.update({
+    "cuda": bench_cuda,
     "cutlass": bench_cutlass,
     "cutedsl": bench_cutedsl,
 })

@@ -7,9 +7,10 @@ rebuilds libcutlass_kernels.so, and benchmarks each config. Restores the
 original instantiate.cu on exit (or interrupt).
 
 Supported families:
-  - wmma           : warp-level mma.sync, scalar s2r (no swizzle bank-free guarantee)
-  - wmma_ldmatrix  : warp-level mma.sync + ldmatrix s2r
+  - wmma           : warp-level mma.sync + ldmatrix s2r, swizzled smem
   - multistage     : above + cp.async pipelined gmem→smem, NUM_STAGES smem buffers
+  - tma            : warp-specialized TMA producer + mma.sync consumers (NUM_STAGES pipe)
+  - cuda_wmma / cuda_multistage / cuda_tma : CUDA-lib equivalents using nvcuda::wmma
 
 Examples:
     python tools/autotune_hgemm.py --family multistage --size 4096
@@ -40,11 +41,38 @@ from bench_utils import (
 )
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths / backend metadata
 # ---------------------------------------------------------------------------
 CUTLASS_HGEMM_INSTANTIATE = ROOT / "CUTLASS" / "hgemm" / "instantiate.cu"
 CUTLASS_BUILD_SO          = ROOT / "CUTLASS" / "build" / "libcutlass_kernels.so"
 CUTLASS_HGEMM_SO_DIR      = ROOT / "CUTLASS" / "build" / "autotune_so_hgemm"
+
+CUDA_HGEMM_INSTANTIATE    = ROOT / "CUDA" / "hgemm" / "instantiate.cu"
+CUDA_BUILD_SO             = ROOT / "CUDA" / "build" / "libcuda_kernels.so"
+CUDA_HGEMM_SO_DIR         = ROOT / "CUDA" / "build" / "autotune_so_hgemm"
+
+BACKENDS = {
+    "cutlass": {
+        "instantiate": CUTLASS_HGEMM_INSTANTIATE,
+        "build_so":    CUTLASS_BUILD_SO,
+        "so_dir":      CUTLASS_HGEMM_SO_DIR,
+        "make_target": "build-cutlass-hgemm",
+        "sym_prefix":  "cutlass_hgemm_",
+        "macro":       "INSTANTIATE_HGEMM",        # for reading existing file (unused in writing)
+        "includes":    ["cuda_fp16.h"],            # first include is always fp16
+        "half_cast":   "cute::half_t",             # reinterpret_cast target
+    },
+    "cuda": {
+        "instantiate": CUDA_HGEMM_INSTANTIATE,
+        "build_so":    CUDA_BUILD_SO,
+        "so_dir":      CUDA_HGEMM_SO_DIR,
+        "make_target": "build-cuda-hgemm",
+        "sym_prefix":  "cuda_hgemm_",
+        "macro":       "INSTANTIATE_HGEMM",
+        "includes":    ["cuda_fp16.h"],
+        "half_cast":   "half",                     # CUDA kernels take `half` directly
+    },
+}
 
 # SM120 budget: 128KB dynamic smem, 48KB static smem
 MAX_DYNAMIC_SMEM = 128 * 1024
@@ -100,6 +128,33 @@ def multistage_precondition(params):
     return True
 
 
+def tma_precondition(params):
+    """Constraints specific to hgemm_tma (warp-specialized TMA producer)."""
+    BM, BN, BK, STAGES = params
+    # Consumer TiledMMA: SM80_16x8x16_F32F16F16F32_TN, warp layout Layout<_2,_4,_1>
+    # Coverage per MMA issue: 2×16=32 in M, 4×8=32 in N. MMA_K = 16.
+    if BM % 32:
+        return False
+    if BN % 32:
+        return False
+    if BK % 16:
+        return False
+    # Smem tile uses GMMA::Layout_K_SW128_Atom<half_t> = (8,64) K-major atom
+    # → BK must be a multiple of 64 (one or more SW128 atoms along K).
+    if BK % 64:
+        return False
+    if STAGES < 2 or STAGES > 8:
+        return False
+    # Dynamic smem: STAGES × (sA + sB) half tiles + 2 × STAGES mbarriers (uint64).
+    smem_data = STAGES * (BM + BN) * BK * 2
+    # 16B-align the mbarrier region (matches kernel layout)
+    smem_data = (smem_data + 15) & ~15
+    smem_bars = 2 * STAGES * 8
+    if smem_data + smem_bars > MAX_DYNAMIC_SMEM:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Family definitions
 # ---------------------------------------------------------------------------
@@ -114,27 +169,135 @@ MULTISTAGE_GRID = {
     "STAGES": [2, 3, 4, 5, 6],
 }
 
+# TMA swizzle atom forces BK ≥ 64 and BK % 64 == 0; grid the bigger tiles
+# since a warp-specialized producer needs K to be large enough to amortize
+# the producer-WG overhead.
+TMA_GRID = {
+    "BM":     [64, 128, 256],
+    "BN":     [64, 128, 256],
+    "BK":     [64, 128],
+    "STAGES": [2, 3, 4, 5, 6],
+}
+
+# ---------------------------------------------------------------------------
+# CUDA-backend preconditions (mirror the kernels in CUDA/hgemm/)
+# ---------------------------------------------------------------------------
+def _cuda_common_ok(BM, BN, BK, WM, WN):
+    """Shared constraints for the CUDA wmma / multistage / tma kernels."""
+    NUM_WARPS   = WM * WN
+    NUM_THREADS = NUM_WARPS * 32
+    if BK % 16:                    return False     # WMMA K = 16
+    if BK % 8:                     return False     # 128-bit vec load
+    if BM % (WM * 16):             return False
+    if BN % (WN * 16):             return False
+    BK_VEC = BK // 8
+    if BK_VEC == 0:                return False
+    if NUM_THREADS % BK_VEC:       return False
+    rows_per_iter = NUM_THREADS // BK_VEC
+    if BM % rows_per_iter:         return False
+    if BN % rows_per_iter:         return False
+    return True
+
+
+def cuda_wmma_precondition(params):
+    BM, BN, BK, WM, WN = params
+    if not _cuda_common_ok(BM, BN, BK, WM, WN): return False
+    PAD = 8
+    smem = (BM + BN) * (BK + PAD) * 2 + WM * WN * 16 * 16 * 4
+    return smem <= MAX_STATIC_SMEM
+
+
+def cuda_multistage_precondition(params):
+    BM, BN, BK, WM, WN, STAGES = params
+    if not _cuda_common_ok(BM, BN, BK, WM, WN): return False
+    if STAGES < 2 or STAGES > 8:                return False
+    PAD = 8
+    smem = STAGES * (BM + BN) * (BK + PAD) * 2 + WM * WN * 16 * 16 * 4
+    # This kernel declares everything static → check static budget.
+    return smem <= MAX_STATIC_SMEM * 2    # SM120 opt-in static cap ~100KB
+
+
+def cuda_tma_precondition(params):
+    BM, BN, BK, WM, WN, STAGES = params
+    if not _cuda_common_ok(BM, BN, BK, WM, WN): return False
+    if STAGES < 2 or STAGES > 6:                return False
+    # barriers + smem data + epi scratch
+    smem = STAGES * (BM + BN) * BK * 2 + WM * WN * 16 * 16 * 4 + 2 * STAGES * 16
+    return smem <= MAX_DYNAMIC_SMEM
+
+
+# Grids: keep WM×WN small so we stay in sensible territory for SM120
+CUDA_WMMA_GRID = {
+    "BM":  [64, 128, 256],
+    "BN":  [64, 128, 256],
+    "BK":  [16, 32, 64],
+    "WM":  [2, 4],
+    "WN":  [2, 4],
+}
+CUDA_MULTISTAGE_GRID = {**CUDA_WMMA_GRID, "STAGES": [2, 3, 4, 5]}
+CUDA_TMA_GRID = {
+    "BM":     [64, 128, 256],
+    "BN":     [64, 128, 256],
+    "BK":     [32, 64, 128],
+    "WM":     [2, 4],
+    "WN":     [2, 4],
+    # STAGES=3 + small tiles (<=64 in M or N) hits a non-deterministic race with
+    # cuda::barrier wait_parity that sanitizer can't see; skip odd stages for now.
+    "STAGES": [2, 4],
+}
+
+
 HGEMM_FAMILIES = {
     "wmma": {
+        "backend":      "cutlass",
         "header":       "hgemm_wmma.cuh",
         "func":         "hgemm_wmma",
         "params":       ["BM", "BN", "BK"],
         "grid":         BASE_GRID,
         "precondition": wmma_precondition,
     },
-    "wmma_ldmatrix": {
-        "header":       "hgemm_wmma_ldmatrix.cuh",
-        "func":         "hgemm_wmma_ldmatrix",
-        "params":       ["BM", "BN", "BK"],
-        "grid":         BASE_GRID,
-        "precondition": wmma_precondition,
-    },
     "multistage": {
+        "backend":      "cutlass",
         "header":       "hgemm_multistage.cuh",
         "func":         "hgemm_multistage",
         "params":       ["BM", "BN", "BK", "STAGES"],
         "grid":         MULTISTAGE_GRID,
         "precondition": multistage_precondition,
+    },
+    "tma": {
+        "backend":      "cutlass",
+        "header":       "hgemm_tma.cuh",
+        "func":         "hgemm_tma",
+        "params":       ["BM", "BN", "BK", "STAGES"],
+        "grid":         TMA_GRID,
+        "precondition": tma_precondition,
+    },
+    "cuda_wmma": {
+        "backend":      "cuda",
+        "header":       "hgemm_wmma.cuh",
+        "func":         "cuda_hgemm_wmma::hgemm_wmma",
+        "params":       ["BM", "BN", "BK", "WM", "WN"],
+        "grid":         CUDA_WMMA_GRID,
+        "precondition": cuda_wmma_precondition,
+        "sym_family":   "wmma",          # instantiated symbol uses this word
+    },
+    "cuda_multistage": {
+        "backend":      "cuda",
+        "header":       "hgemm_multistage.cuh",
+        "func":         "cuda_hgemm_multistage::hgemm_multistage",
+        "params":       ["BM", "BN", "BK", "WM", "WN", "STAGES"],
+        "grid":         CUDA_MULTISTAGE_GRID,
+        "precondition": cuda_multistage_precondition,
+        "sym_family":   "multistage",
+    },
+    "cuda_tma": {
+        "backend":      "cuda",
+        "header":       "hgemm_tma.cuh",
+        "func":         "cuda_hgemm_tma::hgemm_tma",
+        "params":       ["BM", "BN", "BK", "WM", "WN", "STAGES"],
+        "grid":         CUDA_TMA_GRID,
+        "precondition": cuda_tma_precondition,
+        "sym_family":   "tma",
     },
 }
 
@@ -149,17 +312,33 @@ def generate_configs(family_name):
 
 
 # ---------------------------------------------------------------------------
-# Symbol naming + instantiate.cu emission
+# Symbol naming + instantiate.cu emission (backend-aware)
 # ---------------------------------------------------------------------------
 def hgemm_symbol(family_name, params):
+    fam = HGEMM_FAMILIES[family_name]
+    prefix = BACKENDS[fam["backend"]]["sym_prefix"]
+    sym_fam = fam.get("sym_family", family_name)
     tag = "x".join(str(p) for p in params)
-    return f"cutlass_hgemm_{family_name}_{tag}"
+    return f"{prefix}{sym_fam}_{tag}"
 
 
 def hgemm_emit(family_name, params):
-    fam = HGEMM_FAMILIES[family_name]
+    fam  = HGEMM_FAMILIES[family_name]
+    be   = BACKENDS[fam["backend"]]
+    cast = be["half_cast"]
     tmpl = ", ".join(str(p) for p in params)
     sym  = hgemm_symbol(family_name, params)
+    if fam["backend"] == "cuda":
+        # CUDA kernels take `half` natively — no reinterpret_cast needed.
+        return (
+            f'extern "C" void {sym}(\n'
+            f'    int m, int n, int k, float alpha,\n'
+            f'    const half* A, int ldA, const half* B, int ldB,\n'
+            f'    float beta, half* C, int ldC) {{\n'
+            f'    {fam["func"]}<{tmpl}>(\n'
+            f'        m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);\n'
+            f'}}\n\n'
+        )
     return (
         f'extern "C" void {sym}(\n'
         f'    int m, int n, int k, float alpha,\n'
@@ -167,34 +346,40 @@ def hgemm_emit(family_name, params):
         f'    float beta, half* C, int ldC) {{\n'
         f'    {fam["func"]}<{tmpl}>(\n'
         f'        m, n, k, alpha,\n'
-        f'        reinterpret_cast<const cute::half_t*>(A), ldA,\n'
-        f'        reinterpret_cast<const cute::half_t*>(B), ldB,\n'
+        f'        reinterpret_cast<const {cast}*>(A), ldA,\n'
+        f'        reinterpret_cast<const {cast}*>(B), ldB,\n'
         f'        beta,\n'
-        f'        reinterpret_cast<cute::half_t*>(C), ldC);\n'
+        f'        reinterpret_cast<{cast}*>(C), ldC);\n'
         f'}}\n\n'
     )
 
 
 def write_instantiate(batch):
-    """batch: list of (family_name, params) tuples."""
-    parts = ["// Auto-generated by autotune_hgemm.py\n",
-             "#include <cuda_fp16.h>\n"]
+    """batch: list of (family_name, params) tuples. All must share a backend."""
+    backends = {HGEMM_FAMILIES[fn]["backend"] for fn, _ in batch}
+    assert len(backends) == 1, "write_instantiate: batch must be one backend"
+    be = BACKENDS[next(iter(backends))]
+
+    parts = ["// Auto-generated by autotune_hgemm.py\n"]
+    for inc in be["includes"]:
+        parts.append(f"#include <{inc}>\n")
     headers = {HGEMM_FAMILIES[fn]["header"] for fn, _ in batch}
     for h in sorted(headers):
         parts.append(f'#include "{h}"\n')
     parts.append("\n")
     for family_name, params in batch:
         parts.append(hgemm_emit(family_name, params))
-    CUTLASS_HGEMM_INSTANTIATE.write_text("".join(parts))
+    be["instantiate"].write_text("".join(parts))
 
 
 # ---------------------------------------------------------------------------
-# Build
+# Build / snapshot (backend-aware)
 # ---------------------------------------------------------------------------
-def build():
+def build(backend: str):
+    be = BACKENDS[backend]
     try:
         proc = subprocess.run(
-            ["make", "build-cutlass"],
+            ["make", be["make_target"]],
             cwd=str(ROOT),
             capture_output=True, text=True, timeout=600,
         )
@@ -205,10 +390,11 @@ def build():
     return True, ""
 
 
-def snapshot_so(tag: str) -> Path:
-    CUTLASS_HGEMM_SO_DIR.mkdir(parents=True, exist_ok=True)
-    dst = CUTLASS_HGEMM_SO_DIR / f"libkernels_{tag}.so"
-    shutil.copy2(CUTLASS_BUILD_SO, dst)
+def snapshot_so(backend: str, tag: str) -> Path:
+    be = BACKENDS[backend]
+    be["so_dir"].mkdir(parents=True, exist_ok=True)
+    dst = be["so_dir"] / f"libkernels_{tag}.so"
+    shutil.copy2(be["build_so"], dst)
     return dst
 
 
@@ -300,23 +486,27 @@ def cublas_time_ms(M, N, K, dA, dB, dC, warmup, iters):
 # ---------------------------------------------------------------------------
 # Backup / restore
 # ---------------------------------------------------------------------------
-_backup_path: Path = None
+_backup_paths: dict = {}
 
 
-def backup():
-    global _backup_path
-    bak = CUTLASS_HGEMM_INSTANTIATE.with_suffix(
-        CUTLASS_HGEMM_INSTANTIATE.suffix + ".autotune.bak")
-    if not bak.exists():
-        shutil.copy2(CUTLASS_HGEMM_INSTANTIATE, bak)
-    _backup_path = bak
+def backup(backend: str):
+    be = BACKENDS[backend]
+    if backend in _backup_paths:
+        return
+    src = be["instantiate"]
+    bak = src.with_suffix(src.suffix + ".autotune.bak")
+    if not bak.exists() and src.exists():
+        shutil.copy2(src, bak)
+    _backup_paths[backend] = bak
 
 
 def restore():
-    if _backup_path and _backup_path.exists():
-        shutil.copy2(_backup_path, CUTLASS_HGEMM_INSTANTIATE)
-        os.utime(CUTLASS_HGEMM_INSTANTIATE, None)
-        print(f"[autotune] restored {CUTLASS_HGEMM_INSTANTIATE}")
+    for backend, bak in _backup_paths.items():
+        if bak and bak.exists():
+            dst = BACKENDS[backend]["instantiate"]
+            shutil.copy2(bak, dst)
+            os.utime(dst, None)
+            print(f"[autotune] restored {dst}")
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +514,12 @@ def restore():
 # ---------------------------------------------------------------------------
 def run_family(family_name, M, N, K, batch_size, warmup, iters, verbose,
                dA, dB, dC):
+    fam     = HGEMM_FAMILIES[family_name]
+    backend = fam["backend"]
+    backup(backend)
+
     configs = generate_configs(family_name)
-    print(f"\n[{family_name}] {len(configs)} candidates after precondition filter")
+    print(f"\n[{family_name}] ({backend}) {len(configs)} candidates after precondition filter")
     if not configs:
         return []
 
@@ -338,7 +532,7 @@ def run_family(family_name, M, N, K, batch_size, warmup, iters, verbose,
         write_instantiate([(family_name, p) for p in batch])
 
         t0 = time.time()
-        ok, err = build()
+        ok, err = build(backend)
         dt = time.time() - t0
 
         if not ok:
@@ -347,7 +541,7 @@ def run_family(family_name, M, N, K, batch_size, warmup, iters, verbose,
                 print("  " + err.replace("\n", "\n  ")[-1000:])
             continue
 
-        so_path = snapshot_so(f"{family_name}_{bi}")
+        so_path = snapshot_so(backend, f"{family_name}_{bi}")
         try:
             lib = ctypes.CDLL(str(so_path))
         except OSError as e:
@@ -497,8 +691,10 @@ def main():
         dry_run(family_names)
         return
 
-    # Backup and register restore
-    backup()
+    # Backup the instantiate.cu of every backend we might touch, and register restore.
+    touched_backends = {HGEMM_FAMILIES[fn]["backend"] for fn in family_names}
+    for be in touched_backends:
+        backup(be)
     atexit.register(restore)
     signal.signal(signal.SIGINT,  lambda s, f: sys.exit(130))
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(143))
@@ -549,11 +745,12 @@ def main():
         write_csv(all_results, args.csv)
         print(f"\n{len(all_results)} results \u2192 {args.csv}")
 
-    # Restore and rebuild
+    # Restore and rebuild each touched backend from its original instantiate.cu.
     restore()
-    print("[autotune] rebuilding cutlass from original instantiate.cu")
-    subprocess.run(["make", "build-cutlass"],
-                   cwd=str(ROOT), capture_output=True)
+    for be in touched_backends:
+        target = BACKENDS[be]["make_target"]
+        print(f"[autotune] rebuilding {be} via `make {target}`")
+        subprocess.run(["make", target], cwd=str(ROOT), capture_output=True)
 
 
 if __name__ == "__main__":

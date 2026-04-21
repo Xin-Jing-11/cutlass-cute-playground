@@ -23,6 +23,7 @@ from bench_utils import (
     from_gpu,
     gpu_free,
     gpu_sync,
+    load_cuda_lib,
     load_cutlass_lib,
     setup_cublas,
     to_gpu,
@@ -69,8 +70,12 @@ CUTLASS_VARIANTS = _discover_hgemm_variants(
     os.path.join(ROOT, "CUTLASS", "hgemm", "instantiate.cu"),
     "cutlass_hgemm_",
 )
+CUDA_VARIANTS = _discover_hgemm_variants(
+    os.path.join(ROOT, "CUDA", "hgemm", "instantiate.cu"),
+    "cuda_hgemm_",
+)
 
-METHODS = sorted({"cutlass"})
+METHODS = sorted({"cutlass", "cuda"})
 
 def safe_gpu_free(ptr):
     try:
@@ -172,6 +177,51 @@ def check_cutlass(M, N, K, atol, rtol, variant=None):
         if variant is not None and variant_name != variant:
             continue
         name = f"cutlass:{variant_name}"
+        dA = dB = dC = None
+        try:
+            C_h = np.asfortranarray(C.astype(np.float16))
+            dA = to_gpu(A_h)
+            dB = to_gpu(B_h)
+            dC = to_gpu(C_h)
+
+            kernel = getattr(lib, symbol_name)
+            kernel(
+                M, N, K,
+                ctypes.c_float(1.0),
+                ctypes.c_void_p(dA), K,
+                ctypes.c_void_p(dB), K,
+                ctypes.c_float(1.0),
+                ctypes.c_void_p(dC), M,
+            )
+            gpu_sync()
+
+            D_out = from_gpu(dC, (M, N), np.float16, order="F").astype(np.float32)
+            abs_err = float(np.max(np.abs(D_out - D_ref)))
+            rel_err = float(abs_err / (np.max(np.abs(D_ref)) + 1e-6))
+            passed = bool(np.allclose(D_out, D_ref, atol=atol, rtol=rtol))
+            results.append((name, passed, abs_err, rel_err, None))
+        except Exception as err:
+            results.append((name, False, None, None, err))
+        finally:
+            for ptr in (dA, dB, dC):
+                if ptr is not None:
+                    safe_gpu_free(ptr)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CUDA: same TN col-major calling convention as CUTLASS (in-place C)
+# ---------------------------------------------------------------------------
+def check_cuda(M, N, K, atol, rtol, variant=None):
+    lib = load_cuda_lib()
+    A_h, B_h, C, D_ref = cublas_reference(M, N, K)
+
+    results = []
+    for variant_name, symbol_name in sorted(CUDA_VARIANTS.items()):
+        if variant is not None and variant_name != variant:
+            continue
+        name = f"cuda:{variant_name}"
         dA = dB = dC = None
         try:
             C_h = np.asfortranarray(C.astype(np.float16))

@@ -47,10 +47,8 @@ def canonical(kernel):
     """
     if kernel.startswith("multistage_"):
         return f"ms  {_multistage_cfg(kernel[len('multistage_'):])}"
-    if kernel.startswith("wmma_ldmatrix_"):
-        return f"wmma+ld  {_wmma_cfg(kernel[len('wmma_ldmatrix_'):])}"
-    if kernel.startswith("mma_ldmatrix_"):
-        return f"wmma+ld  {_wmma_cfg(kernel[len('mma_ldmatrix_'):])}"
+    if kernel.startswith("tma_"):
+        return f"tma  {_multistage_cfg(kernel[len('tma_'):])}"
     if kernel.startswith("wmma_"):
         return f"wmma  {_wmma_cfg(kernel[len('wmma_'):])}"
     if kernel.startswith("mma_"):
@@ -75,7 +73,7 @@ def _multistage_cfg(body):
     return body.replace("x", "×")
 
 
-FAMILY_RANK = {"wmma": 0, "wmma+ld": 1, "ms": 2}
+FAMILY_RANK = {"wmma": 0, "ms": 1, "tma": 2}
 
 
 def _family_rank(fam_label):
@@ -91,12 +89,14 @@ def _family_rank(fam_label):
 BACKEND_COLORS = {
     "cutlass": "#2ca02c",
     "cutedsl": "#ff7f0e",
+    "cuda":    "#1f77b4",
 }
 BACKEND_TAG = {
     "cutlass": "CUTLASS",
     "cutedsl": "CuTeDSL",
+    "cuda":    "CUDA",
 }
-BACKEND_ORDER = ["cutlass", "cutedsl"]
+BACKEND_ORDER = ["cutlass", "cutedsl", "cuda"]
 
 
 def build_plot(entries, cublas_gflops, size, out_path):
@@ -176,8 +176,8 @@ def build_plot(entries, cublas_gflops, size, out_path):
     ax.set_xlabel("Throughput (GFLOPS)", fontsize=12)
     ax.set_title(
         f"HGEMM  —  M=N=K={size}, FP16 in/out, FP32 acc, RTX 5080 (SM 120)\n"
-        f"wmma=mma.sync, +ld=ldmatrix s2r, ms=multistage cp.async; "
-        f"tiles show BM×BN×BK (, s=stages)",
+        f"wmma=mma.sync, +ld=ldmatrix s2r, ms=multistage cp.async, "
+        f"tma=warp-spec TMA producer; tiles show BM×BN×BK (, s=stages)",
         fontsize=11, pad=14,
     )
     ax.set_xlim(family_x * 1.05, x_max)
