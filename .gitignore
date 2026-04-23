@@ -1,9 +1,10 @@
 # Claude Code
 .claude/
+docs/
+perf_analysis/
 
 # Build artifacts
 build/
-CUTLASS/build/
 
 # Python
 __pycache__/

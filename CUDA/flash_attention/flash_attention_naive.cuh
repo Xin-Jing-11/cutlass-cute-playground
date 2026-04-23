@@ -16,9 +16,9 @@
  * one thread per query row, no tensor cores (plain FFMA32).
  */
 
-template<int Bc=8, int Br=32>
+template<int Br=32, int Bc=8>
 __global__
-void flash_attention_v1_kernel(
+void flash_attention_naive_kernel(
     const __half* Q,
     const __half* K,
     const __half* V,
@@ -147,7 +147,7 @@ void flash_attention_v1_kernel(
 }
 
 
-__global__ void flash_attention_v1_init_kernel(
+__global__ void flash_attention_naive_init_kernel(
     float* l, float* m, __half* out, int n_lm, int n_out
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -162,7 +162,7 @@ __global__ void flash_attention_v1_init_kernel(
 
 
 template<int Bc = 8, int Br = 32>
-void flash_attention_v1(
+void flash_attention_naive(
     const __half* Q, const __half* K, const __half* V, const __half* mask,
     __half* out, int batch_size, int num_heads, int seq_len, int d_model
 ) {
@@ -176,14 +176,14 @@ void flash_attention_v1(
 
     const int init_threads = 256;
     const int init_blocks = (n_out + init_threads - 1) / init_threads;
-    flash_attention_v1_init_kernel<<<init_blocks, init_threads>>>(l, m, out, n_lm, n_out);
+    flash_attention_naive_init_kernel<<<init_blocks, init_threads>>>(l, m, out, n_lm, n_out);
 
     const int d_padded = ((d_model + 31) / 32) * 32 + 1;
     const size_t smem_bytes = (Br + 2 * Bc) * d_padded * sizeof(__half);
 
     dim3 grid(bh);
     dim3 block(Br);
-    flash_attention_v1_kernel<Bc, Br><<<grid, block, smem_bytes>>>(
+    flash_attention_naive_kernel<Br, Bc><<<grid, block, smem_bytes>>>(
         Q, K, V, mask, l, m, out, seq_len, d_model);
 
     cudaFree(l);
