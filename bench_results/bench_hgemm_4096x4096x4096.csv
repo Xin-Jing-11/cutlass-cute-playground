@@ -1,0 +1,9 @@
+backend,kernel,time_ms,gflops
+cublas,cuBLAS,0.3106,442721
+cutlass,wgmma_cluster_128x128x64x3,0.3576,384504
+cutlass,wgmma_cluster_128x128x64x5,0.3628,379019
+cutlass,wgmma_cluster_128x128x64x4,0.3678,373843
+cutlass,wgmma_128x128x64x3,0.3844,357634
+cutlass,tma_128x64x64x2,0.7406,185640
+cutlass,multistage_128x128x32x4,0.7477,183889
+cutlass,wmma_128x128x16,0.9999,137510

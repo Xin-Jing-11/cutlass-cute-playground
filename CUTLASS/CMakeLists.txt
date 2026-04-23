@@ -9,7 +9,13 @@ execute_process(
     ERROR_QUIET
 )
 if(GPU_CC)
-    string(REPLACE "." "" CUDA_ARCH_LIST "${GPU_CC}")
+    # Take only the first GPU's compute capability (multi-GPU returns one line per device)
+    string(REGEX MATCH "[0-9]+\\.[0-9]+" GPU_CC_FIRST "${GPU_CC}")
+    string(REPLACE "." "" CUDA_ARCH_LIST "${GPU_CC_FIRST}")
+    # For SM90 (Hopper), always use 90a to enable TMA + WGMMA
+    if(CUDA_ARCH_LIST STREQUAL "90")
+        set(CUDA_ARCH_LIST "90a")
+    endif()
 else()
     set(CUDA_ARCH_LIST "120")
 endif()
@@ -19,7 +25,9 @@ message(STATUS "Detected GPU architecture: ${CUDA_ARCH_LIST}")
 # Note: sm_90a-compiled code only *executes* on Hopper (H100/H200).
 # On Blackwell consumer (SM120), the binary builds but the WGMMA kernel
 # falls through to CUTE_INVALID_CONTROL_PATH at runtime.
-list(APPEND CUDA_ARCH_LIST "90a")
+if(NOT "90a" IN_LIST CUDA_ARCH_LIST)
+    list(APPEND CUDA_ARCH_LIST "90a")
+endif()
 
 # Upgrade "120" -> "120a": hgemm_tma uses SM90 TMA intrinsics. The SM120
 # (shared::cta) PTX variant is only emitted when CUTLASS_ARCH_MMA_SM120A_ENABLED

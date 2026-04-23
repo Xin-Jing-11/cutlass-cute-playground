@@ -7,6 +7,8 @@
     SCRIPT="${1:?Usage: $0 <python_script> [args...]}"
     shift
 
+    mkdir -p ncu_report
+
     ncu \
       --set full \
       --target-processes all \

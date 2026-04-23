@@ -13,6 +13,7 @@ Examples:
 
 import argparse
 import ctypes
+import csv
 import os
 import re
 
@@ -348,6 +349,20 @@ def main():
             print_result_row(name, M, N, K, ms)
         else:
             print_failure_row(name, err)
+
+    # Save results to CSV in bench_results/
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_results")
+    os.makedirs(results_dir, exist_ok=True)
+    csv_path = os.path.join(results_dir, f"bench_hgemm_{M}x{N}x{K}.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["backend", "kernel", "time_ms", "gflops"])
+        writer.writerow(["cublas", "cuBLAS", f"{cublas_ms:.4f}", f"{gflops(M, N, K, cublas_ms):.0f}"])
+        for name, ms, err in all_results:
+            if err is None and ms is not None:
+                backend, kernel = name.split(":", 1) if ":" in name else ("unknown", name)
+                writer.writerow([backend, kernel, f"{ms:.4f}", f"{gflops(M, N, K, ms):.0f}"])
+    print(f"\nResults saved to {csv_path}")
 
 
 if __name__ == "__main__":

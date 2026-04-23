@@ -1,42 +1,21 @@
 #!/usr/bin/env python3
 """
-Run bench_sgemm.py at a given size and produce a grouped-by-family bar chart.
-
-Results are saved under ./bench_results/ by default.
+Plot SGEMM benchmark results from CSV data in bench_results/.
 
 Usage:
-    python plot_sgemm.py                       # size=4096, out=bench_results/bench_sgemm_4096.png
+    python plot_sgemm.py                       # size=4096, out=bench_results/bench_sgemm_4096_H100.png
     python plot_sgemm.py --size 2048
-    python plot_sgemm.py --size 8192 --output my_bench.png
+    python plot_sgemm.py --gpu RTX5080
+    python plot_sgemm.py --csv bench_results/bench_sgemm_4096x4096x4096.csv
 """
 import argparse
+import csv
 import os
-import re
-import subprocess
 import sys
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-
-
-def parse_bench_output(text):
-    entries = []
-    cublas_gflops = None
-    line_re = re.compile(r"^([A-Za-z0-9_:]+)\s+([\d\.]+)\s*ms\s+(\d+)\s*GF/s")
-    for line in text.splitlines():
-        m = line_re.match(line.strip())
-        if not m:
-            continue
-        name, _, gflops = m.group(1), float(m.group(2)), int(m.group(3))
-        if name == "cuBLAS":
-            cublas_gflops = gflops
-            continue
-        if ":" not in name:
-            continue
-        backend, kernel = name.split(":", 1)
-        entries.append((backend, kernel, gflops))
-    return entries, cublas_gflops
 
 
 def canonical(kernel):
@@ -124,7 +103,13 @@ BACKEND_TAG = {
 BACKEND_ORDER = ["cuda", "cutlass", "cutedsl"]
 
 
-def build_plot(entries, cublas_gflops, size, out_path):
+GPU_INFO = {
+    "H100":    "H100 NVL (SM 90a)",
+    "RTX5080": "RTX 5080 (SM 120)",
+}
+
+
+def build_plot(entries, cublas_gflops, size, out_path, gpu="H100"):
     data = defaultdict(list)
     for backend, kernel, gflops in entries:
         fam = canonical(kernel)
@@ -200,8 +185,9 @@ def build_plot(entries, cublas_gflops, size, out_path):
     ax.set_yticks([])
     ax.invert_yaxis()
     ax.set_xlabel("Throughput (GFLOPS)", fontsize=12)
+    gpu_label = GPU_INFO.get(gpu, gpu)
     ax.set_title(
-        f"SGEMM  —  M=N=K={size}, FP32, RTX 5080 (SM 120)\n"
+        f"SGEMM  —  M=N=K={size}, FP32, {gpu_label}\n"
         f"tl=tiling, wt=warptiling, db=double_buf, +v=vectorized, (mc)=M-contiguous; "
         f"tiles show BM×BN×BK",
         fontsize=11, pad=14,
@@ -231,34 +217,44 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_re
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run bench_sgemm.py and plot results grouped by kernel family.")
-    parser.add_argument("--size", type=int, default=4096)
+        description="Plot SGEMM benchmark results from CSV data in bench_results/.")
+    parser.add_argument("--size", type=int, default=4096,
+                        help="Square problem size (matches bench CSV filename, default: 4096)")
+    parser.add_argument("--gpu", choices=["H100", "RTX5080"], default="H100",
+                        help="GPU label for plot title and output filename (default: H100)")
     parser.add_argument("--output", "-o", default=None)
-    parser.add_argument("--bench-script", default="bench_sgemm.py")
-    parser.add_argument("--log", default=None)
+    parser.add_argument("--csv", default=None,
+                        help="Path to bench CSV file (default: bench_results/bench_sgemm_<size>x<size>x<size>.csv)")
     args = parser.parse_args()
 
-    out_path = args.output or os.path.join(RESULTS_DIR, f"bench_sgemm_{args.size}.png")
+    out_path = args.output or os.path.join(
+        RESULTS_DIR, f"bench_sgemm_{args.size}_{args.gpu}.png")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-    if args.log:
-        with open(args.log) as f:
-            text = f.read()
-    else:
-        cmd = [sys.executable, args.bench_script, "--size", str(args.size)]
-        print(f"Running: {' '.join(cmd)}", flush=True)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(result.stderr, file=sys.stderr)
-            sys.exit(result.returncode)
-        text = result.stdout
-        print(text)
-
-    entries, cublas_gflops = parse_bench_output(text)
-    if not entries:
-        print("No benchmark entries parsed — aborting.", file=sys.stderr)
+    csv_path = args.csv or os.path.join(
+        RESULTS_DIR, f"bench_sgemm_{args.size}x{args.size}x{args.size}.csv")
+    if not os.path.exists(csv_path):
+        print(f"CSV not found: {csv_path}", file=sys.stderr)
+        print("Run bench_sgemm.py first to generate benchmark data.", file=sys.stderr)
         sys.exit(1)
-    build_plot(entries, cublas_gflops, args.size, out_path)
+
+    entries = []
+    cublas_gflops = None
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            backend = row["backend"]
+            kernel = row["kernel"]
+            gf = int(row["gflops"])
+            if backend == "cublas":
+                cublas_gflops = gf
+            else:
+                entries.append((backend, kernel, gf))
+
+    if not entries:
+        print("No benchmark entries found in CSV — aborting.", file=sys.stderr)
+        sys.exit(1)
+    build_plot(entries, cublas_gflops, args.size, out_path, gpu=args.gpu)
 
 
 if __name__ == "__main__":
