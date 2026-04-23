@@ -10,6 +10,7 @@
 #include "flash_attention_pregs.cuh"
 #include "flash_attention_wsp.cuh"
 #include "flash_attention_fa3.cuh"
+#include "flash_attention_wgmma.cuh"
 
 #define INSTANTIATE_FLASH_ATTENTION_NAIVE(BC, BR)                         \
   extern "C" void cutlass_flash_attention_naive_##BC##x##BR(              \
@@ -290,6 +291,58 @@ INSTANTIATE_FLASH_ATTENTION_FA3_D128_S3(32, 64)
 
 #undef INSTANTIATE_FLASH_ATTENTION_FA3_D128_S2
 #undef INSTANTIATE_FLASH_ATTENTION_FA3_D128_S3
+
+// wgmma: TMA + WGMMA (SM90) warp-specialized. Br fixed at 64.
+#define INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S2(BC, BR)                              \
+  extern "C" void cutlass_flash_attention_wgmma_d128_s2_##BC##x##BR(                   \
+      int batch_size, int num_heads, int seq_len, int d_model,                         \
+      const void* Q, const void* K, const void* V,                                     \
+      const void* mask, void* out) {                                                   \
+    flash_attention_wgmma<BC, 128, 2>(                                                 \
+        batch_size, num_heads, seq_len, d_model,                                       \
+        reinterpret_cast<const cute::half_t*>(Q),                                      \
+        reinterpret_cast<const cute::half_t*>(K),                                      \
+        reinterpret_cast<const cute::half_t*>(V),                                      \
+        reinterpret_cast<const cute::half_t*>(mask),                                   \
+        reinterpret_cast<cute::half_t*>(out));                                         \
+  }
+#define INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S3(BC, BR)                              \
+  extern "C" void cutlass_flash_attention_wgmma_d128_s3_##BC##x##BR(                   \
+      int batch_size, int num_heads, int seq_len, int d_model,                         \
+      const void* Q, const void* K, const void* V,                                     \
+      const void* mask, void* out) {                                                   \
+    flash_attention_wgmma<BC, 128, 3>(                                                 \
+        batch_size, num_heads, seq_len, d_model,                                       \
+        reinterpret_cast<const cute::half_t*>(Q),                                      \
+        reinterpret_cast<const cute::half_t*>(K),                                      \
+        reinterpret_cast<const cute::half_t*>(V),                                      \
+        reinterpret_cast<const cute::half_t*>(mask),                                   \
+        reinterpret_cast<cute::half_t*>(out));                                         \
+  }
+
+#define INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S4(BC, BR)                              \
+  extern "C" void cutlass_flash_attention_wgmma_d128_s4_##BC##x##BR(                   \
+      int batch_size, int num_heads, int seq_len, int d_model,                         \
+      const void* Q, const void* K, const void* V,                                     \
+      const void* mask, void* out) {                                                   \
+    flash_attention_wgmma<BC, 128, 4>(                                                 \
+        batch_size, num_heads, seq_len, d_model,                                       \
+        reinterpret_cast<const cute::half_t*>(Q),                                      \
+        reinterpret_cast<const cute::half_t*>(K),                                      \
+        reinterpret_cast<const cute::half_t*>(V),                                      \
+        reinterpret_cast<const cute::half_t*>(mask),                                   \
+        reinterpret_cast<cute::half_t*>(out));                                         \
+  }
+
+INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S2(64, 64)
+INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S3(64, 64)
+INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S4(64, 64)
+INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S2(128, 64)
+INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S3(128, 64)
+
+#undef INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S2
+#undef INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S3
+#undef INSTANTIATE_FLASH_ATTENTION_WGMMA_D128_S4
 
 #undef INSTANTIATE_FLASH_ATTENTION_MMA_D64
 #undef INSTANTIATE_FLASH_ATTENTION_MMA_D128
