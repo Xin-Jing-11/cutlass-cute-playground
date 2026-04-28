@@ -80,6 +80,6 @@ endif()
 add_library(cutlass_kernels SHARED ${KERNEL_SOURCES})
 target_link_libraries(cutlass_kernels cublas cuda -static-libstdc++)
 set_target_properties(cutlass_kernels PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON
 )

@@ -1,25 +1,28 @@
 cmake_minimum_required(VERSION 3.18)
-project(cuda_kernels CUDA)
 
-# Auto-detect GPU architecture via nvidia-smi
-execute_process(
-    COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
-    OUTPUT_VARIABLE GPU_CC
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(GPU_CC)
-    # Handle multi-GPU: take only the first architecture
-    string(REGEX MATCH "[0-9]+\\.[0-9]+" GPU_CC_FIRST "${GPU_CC}")
-    string(REPLACE "." "" CUDA_ARCH_LIST "${GPU_CC_FIRST}")
-else()
-    set(CUDA_ARCH_LIST "120")
+# Auto-detect GPU architecture via nvidia-smi BEFORE project() so that
+# CMAKE_CUDA_ARCHITECTURES is set before CMake's compiler detection.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    execute_process(
+        COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+        OUTPUT_VARIABLE GPU_CC
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(GPU_CC)
+        string(REGEX MATCH "[0-9]+\\.[0-9]+" GPU_CC_FIRST "${GPU_CC}")
+        string(REPLACE "." "" CUDA_ARCH_LIST "${GPU_CC_FIRST}")
+    else()
+        set(CUDA_ARCH_LIST "90")
+    endif()
+    # Upgrade to arch-accelerated variants so WGMMA / TMA PTX compiles.
+    string(REGEX REPLACE "^90$" "90a" CUDA_ARCH_LIST "${CUDA_ARCH_LIST}")
+    string(REGEX REPLACE "^120$" "120a" CUDA_ARCH_LIST "${CUDA_ARCH_LIST}")
+    set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+    message(STATUS "Detected GPU architecture: ${CUDA_ARCH_LIST}")
 endif()
-message(STATUS "Detected GPU architecture: ${CUDA_ARCH_LIST}")
 
-# Upgrade "120" -> "120a" so TMA PTX (cp.async.bulk.tensor.*.shared::cta)
-# compiles correctly for SM120 consumer Blackwell.
-list(TRANSFORM CUDA_ARCH_LIST REPLACE "^120$" "120a")
+project(cuda_kernels CUDA)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -32,8 +35,6 @@ set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -O0 -DDEBUG")
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-
-set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 

@@ -1,0 +1,315 @@
+"""
+Warp-specialized TMA + WGMMA HGEMM using CuTe DSL (TN): C = alpha * A^T * B + beta * C
+
+1 producer WG (TMA loads) + NCS consumer WGs (WGMMA compute).
+Matches CUTLASS/hgemm/hgemm_warp_specialization.cuh.
+"""
+
+import sys
+import numpy as np
+import cupy as cp
+import cuda.bindings.driver as cuda_driver
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+import cutlass.utils as utils
+import cutlass.utils.hopper_helpers as sm90_utils
+from cutlass.cute.runtime import from_dlpack
+
+
+class HgemmWarpSpecialization:
+    def __init__(self, bm=128, bn=256, num_consumer_warpgroups=2, num_stages=4):
+        self._bm = bm
+        self._bn = bn
+        self._bk = None
+        self._num_stages = num_stages
+        self._num_consumer_warpgroups = num_consumer_warpgroups
+        self._num_dma_warp_groups = 1
+        self._threads_per_cta = (1 + num_consumer_warpgroups) * 128
+        self._load_register_requirement = 40
+        self._mma_register_requirement = 232
+        self._tile_shape_mnk = None
+        self._tiled_mma = None
+        self._atom_layout_mnk = (2, 1, 1) if bm > 64 and bn > 128 else (1, 1, 1)
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        alpha: cutlass.Float32 = 1.0,
+        beta: cutlass.Float32 = 0.0,
+        stream: cuda_driver.CUstream = cuda_driver.CUstream(
+            cuda_driver.CUstream_flags.CU_STREAM_DEFAULT
+        ),
+    ):
+        BM, BN = self._bm, self._bn
+        S = self._num_stages
+
+        a_layout_enum = utils.LayoutEnum.from_tensor(mA)
+        b_layout_enum = utils.LayoutEnum.from_tensor(mB)
+
+        self._tiled_mma = sm90_utils.make_trivial_tiled_mma(
+            mA.element_type, mB.element_type,
+            a_layout_enum.sm90_mma_major_mode(),
+            b_layout_enum.sm90_mma_major_mode(),
+            cutlass.Float32,
+            self._atom_layout_mnk,
+            tiler_mn=(64, BN),
+        )
+
+        mma_inst_shape_k = cute.size(self._tiled_mma.shape_mnk, mode=[2])
+        self._bk = mma_inst_shape_k * 4
+        BK = self._bk
+        self._tile_shape_mnk = (BM, BN, BK)
+
+        a_smem_layout_staged = sm90_utils.make_smem_layout_a(
+            a_layout_enum, self._tile_shape_mnk, mA.element_type, S)
+        b_smem_layout_staged = sm90_utils.make_smem_layout_b(
+            b_layout_enum, self._tile_shape_mnk, mB.element_type, S)
+
+        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
+        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
+
+        tma_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+        tma_atom_a, tma_tensor_a = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_op, mA, a_smem_layout, (BM, BK))
+        tma_atom_b, tma_tensor_b = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_op, mB, b_smem_layout, (BN, BK))
+
+        buffer_align = 1024
+
+        @cute.struct
+        class SharedStorage:
+            mainloop_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, S * 2]
+            sA: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float16, cute.cosize(a_smem_layout_staged)],
+                buffer_align,
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float16, cute.cosize(b_smem_layout_staged)],
+                buffer_align,
+            ]
+
+        self._shared_storage = SharedStorage
+
+        grid_dim = (*cute.ceil_div(mC.shape, (BM, BN)), 1)
+
+        self.kernel(
+            tma_atom_a, tma_tensor_a,
+            tma_atom_b, tma_tensor_b,
+            mC, alpha, beta,
+            self._tiled_mma,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+        ).launch(
+            grid=grid_dim,
+            block=[self._threads_per_cta, 1, 1],
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tma_atom_a: cute.CopyAtom,
+        mA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nk: cute.Tensor,
+        mC: cute.Tensor,
+        alpha: cutlass.Float32,
+        beta: cutlass.Float32,
+        tiled_mma: cute.TiledMma,
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_smem_layout_staged: cute.ComposedLayout,
+    ):
+        BM, BN, BK = self._tile_shape_mnk
+        S = self._num_stages
+        NCS = self._num_consumer_warpgroups
+
+        bidx, bidy, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        warp_group_idx = cute.arch.make_warp_uniform(tidx // 128)
+
+        tile_coord = (bidx, bidy, None)
+
+        # Prefetch TMA descriptors
+        if warp_idx == 0:
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+
+        # Shared memory
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self._shared_storage)
+        mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
+
+        # Pipeline setup
+        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
+        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
+        tma_copy_bytes = (
+            cute.size_in_bytes(cutlass.Float16, a_smem_layout)
+            + cute.size_in_bytes(cutlass.Float16, b_smem_layout)
+        )
+
+        num_mma_warps = NCS * 4
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_mma_warps)
+
+        cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
+        mainloop_pipeline = pipeline.PipelineTmaAsync.create(
+            barrier_storage=mainloop_pipeline_array_ptr,
+            num_stages=S,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=tma_copy_bytes,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+
+        # Smem tensors
+        sA = storage.sA.get_tensor(
+            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
+        sB = storage.sB.get_tensor(
+            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+
+        # Global tile
+        gA = cute.local_tile(mA_mk, self._tile_shape_mnk, tile_coord, proj=(1, None, 1))
+        gB = cute.local_tile(mB_nk, self._tile_shape_mnk, tile_coord, proj=(None, 1, 1))
+        gC = cute.local_tile(mC, self._tile_shape_mnk, tile_coord, proj=(1, 1, None))
+
+        # TMA partitions
+        sA_for_tma = cute.group_modes(sA, 0, 2)
+        gA_for_tma = cute.group_modes(gA, 0, 2)
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a, 0, cute.make_layout(1), sA_for_tma, gA_for_tma)
+
+        sB_for_tma = cute.group_modes(sB, 0, 2)
+        gB_for_tma = cute.group_modes(gB, 0, 2)
+        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b, 0, cute.make_layout(1), sB_for_tma, gB_for_tma)
+
+        # MMA partitions — use tidx offset by DMA threads
+        # For DMA WG (tidx 0-127), this gives nonsense values but they're never used
+        mma_tidx = tidx - self._num_dma_warp_groups * 128
+        thr_mma = tiled_mma.get_slice(mma_tidx)
+        tCsA = thr_mma.partition_A(sA)
+        tCsB = thr_mma.partition_B(sB)
+        tCrA = tiled_mma.make_fragment_A(tCsA)
+        tCrB = tiled_mma.make_fragment_B(tCsB)
+        tCgC = thr_mma.partition_C(gC)
+        acc_shape = tCgC.shape
+        accumulators = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
+
+        pipeline_init_wait(cluster_shape_mn=(1, 1))
+
+        k_tile_cnt = cute.size(gA, mode=[2])
+        num_k_blocks = cute.size(tCrA, mode=[2])
+        k_pipe_mmas = 1
+
+        is_dma_warp_group = warp_group_idx < self._num_dma_warp_groups
+
+        # ===== PRODUCER =====
+        if is_dma_warp_group:
+            cute.arch.setmaxregister_decrease(self._load_register_requirement)
+            if warp_idx == 0:
+                producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, S)
+                for k_tile in range(k_tile_cnt):
+                    mainloop_pipeline.producer_acquire(producer_state)
+                    cute.copy(tma_atom_a,
+                              tAgA[(None, producer_state.count)],
+                              tAsA[(None, producer_state.index)],
+                              tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
+                              mcast_mask=0)
+                    cute.copy(tma_atom_b,
+                              tBgB[(None, producer_state.count)],
+                              tBsB[(None, producer_state.index)],
+                              tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
+                              mcast_mask=0)
+                    mainloop_pipeline.producer_commit(producer_state)
+                    producer_state.advance()
+                mainloop_pipeline.producer_tail(producer_state)
+
+        # ===== CONSUMER =====
+        if not is_dma_warp_group:
+            cute.arch.setmaxregister_increase(self._mma_register_requirement)
+
+            consumer_read_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, S)
+            consumer_release_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, S)
+
+            # Prologue MMA
+            accumulators.fill(0.0)
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+            cute.nvgpu.warpgroup.fence()
+
+            for k_tile in cutlass.range_constexpr(k_pipe_mmas):
+                mainloop_pipeline.consumer_wait(consumer_read_state)
+                for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                    k_block_coord = (None, None, k_block_idx, consumer_read_state.index)
+                    cute.gemm(tiled_mma, accumulators,
+                              tCrA[k_block_coord], tCrB[k_block_coord], accumulators)
+                cute.nvgpu.warpgroup.commit_group()
+                consumer_read_state.advance()
+
+            # Mainloop
+            for k_tile in cutlass.range(k_pipe_mmas, k_tile_cnt, 1, unroll=1):
+                mainloop_pipeline.consumer_wait(consumer_read_state)
+                for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                    k_block_coord = (None, None, k_block_idx, consumer_read_state.index)
+                    cute.gemm(tiled_mma, accumulators,
+                              tCrA[k_block_coord], tCrB[k_block_coord], accumulators)
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
+                mainloop_pipeline.consumer_release(consumer_release_state)
+                consumer_read_state.advance()
+                consumer_release_state.advance()
+
+            cute.nvgpu.warpgroup.wait_group(0)
+            for k_tile in range(k_pipe_mmas):
+                mainloop_pipeline.consumer_release(consumer_release_state)
+                consumer_release_state.advance()
+
+            # Epilogue
+            cute.arch.sync_threads()
+            epilogue_f32 = alpha * accumulators.load() + beta * tCgC.load()
+            tCrC = cute.make_fragment_like(tCgC)
+            tCrC.store(epilogue_f32.to(cutlass.Float16))
+            cute.autovec_copy(tCrC, tCgC)
+
+
+def run_gemm_warp_spec(M, N, K, num_consumer_wgs=2, num_stages=4):
+    np.random.seed(42)
+    A_h = np.asfortranarray(np.random.randn(K, M).astype(np.float16))
+    B_h = np.asfortranarray(np.random.randn(K, N).astype(np.float16))
+    A_d = cp.array(A_h, order='F')
+    B_d = cp.array(B_h, order='F')
+    C_d = cp.zeros((M, N), dtype=cp.float16, order='F')
+    A_t = from_dlpack(A_d.T, assumed_align=16)
+    B_t = from_dlpack(B_d.T, assumed_align=16)
+    C_t = from_dlpack(C_d, assumed_align=16)
+    gemm = HgemmWarpSpecialization(
+        num_consumer_warpgroups=num_consumer_wgs, num_stages=num_stages)
+    gemm(A_t, B_t, C_t, alpha=1.0, beta=0.0)
+    C_out = cp.asnumpy(C_d).astype(np.float32)
+    D_ref = A_h.T.astype(np.float32) @ B_h.astype(np.float32)
+    abs_err = np.max(np.abs(C_out - D_ref))
+    ref_norm = np.max(np.abs(D_ref)) + 1e-6
+    rel_err = abs_err / ref_norm
+    print(f"M={M} N={N} K={K}  abs_err={abs_err:.3e}  rel_err={rel_err:.3e}  "
+          f"{'PASS' if rel_err < 0.05 else 'FAIL'}")
+
+
+if __name__ == "__main__":
+    M = int(sys.argv[1]) if len(sys.argv) > 1 else 256
+    N = int(sys.argv[2]) if len(sys.argv) > 2 else 256
+    K = int(sys.argv[3]) if len(sys.argv) > 3 else 256
+    run_gemm_warp_spec(M, N, K)

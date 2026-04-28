@@ -75,7 +75,7 @@ CUDA_VARIANTS = _discover_hgemm_variants(
     "cuda_hgemm_",
 )
 
-METHODS = sorted({"cutlass", "cuda"})
+METHODS = sorted({"cutlass", "cuda", "cutedsl"})
 
 def safe_gpu_free(ptr):
     try:
@@ -251,6 +251,61 @@ def check_cuda(M, N, K, atol, rtol, variant=None):
             for ptr in (dA, dB, dC):
                 if ptr is not None:
                     safe_gpu_free(ptr)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CuTeDSL: JIT compiled, same TN col-major layout
+# ---------------------------------------------------------------------------
+def check_cutedsl(M, N, K, atol, rtol, variant=None):
+    import cupy as cp
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from CuTeDSL.hgemm.instantiate import VARIANTS as CUTEDSL_VARIANTS
+
+    A_h, B_h, C, D_ref = cublas_reference(M, N, K)
+
+    # CuTeDSL tensors: A(M,K):(K,1), B(N,K):(K,1), C(M,N):(1,M)
+    A_d = cp.array(A_h, order="F")   # (K,M)
+    B_d = cp.array(B_h, order="F")   # (K,N)
+
+    A_t = from_dlpack(A_d.T, assumed_align=16)  # (M,K):(K,1)
+    B_t = from_dlpack(B_d.T, assumed_align=16)  # (N,K):(K,1)
+
+    results = []
+    for variant_name, (gemm_cls, kwargs) in sorted(CUTEDSL_VARIANTS.items()):
+        if variant is not None and variant_name != variant:
+            continue
+        name = f"cutedsl:{variant_name}"
+        try:
+            # TMA store epilogue variants only support beta=0 (write-only epilogue)
+            tma_store_variants = ("epilogue", "optimized")
+            is_tma_store = any(variant_name.startswith(v) for v in tma_store_variants)
+            use_beta = 0.0 if is_tma_store else 1.0
+
+            if is_tma_store:
+                # For beta=0 kernels, zero out C and use beta=0 reference
+                C_h = np.asfortranarray(np.zeros((M, N), dtype=np.float16))
+                D_ref_local = D_ref - C.astype(np.float16).astype(np.float32)
+            else:
+                C_h = np.asfortranarray(C.astype(np.float16))
+                D_ref_local = D_ref
+
+            C_d = cp.array(C_h, order="F")
+            C_t = from_dlpack(C_d, assumed_align=16)
+
+            gemm = gemm_cls(**kwargs)
+            gemm(A_t, B_t, C_t, alpha=1.0, beta=use_beta)
+            cp.cuda.get_current_stream().synchronize()
+
+            D_out = cp.asnumpy(C_d).astype(np.float32)
+            abs_err = float(np.max(np.abs(D_out - D_ref_local)))
+            rel_err = float(abs_err / (np.max(np.abs(D_ref_local)) + 1e-6))
+            passed = bool(np.allclose(D_out, D_ref_local, atol=atol, rtol=rtol))
+            results.append((name, passed, abs_err, rel_err, None))
+        except Exception as err:
+            results.append((name, False, None, None, err))
 
     return results
 
